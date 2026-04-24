@@ -1,0 +1,29 @@
+# -----------------
+# Tensor B (afgh)
+# Converted from cutensor_data format
+# -----------------
+# Number of sections {a, f, g, h}
+{2, 3, 3, 2}
+# Number of non-zero blocks (nnz)
+18
+# Block sizes per dimension
+{802, 797, 1, 2, 1, 1, 2, 1, 801, 798}
+# Non-zero block coordinates (0-indexed)
+0, 0, 0, 0
+1, 1, 0, 0
+0, 2, 0, 0
+1, 0, 1, 0
+0, 1, 1, 0
+1, 2, 1, 0
+0, 0, 2, 0
+1, 1, 2, 0
+0, 2, 2, 0
+1, 0, 0, 1
+0, 1, 0, 1
+1, 2, 0, 1
+0, 0, 1, 1
+1, 1, 1, 1
+0, 2, 1, 1
+1, 0, 2, 1
+0, 1, 2, 1
+1, 2, 2, 1

@@ -1,0 +1,5 @@
+einsum: ade,afgh->defgh
+A_blocks: 361
+B_blocks: 478
+A_rank: 3
+B_rank: 4

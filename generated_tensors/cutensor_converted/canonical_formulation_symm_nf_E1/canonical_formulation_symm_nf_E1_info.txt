@@ -1,0 +1,5 @@
+einsum: dea,fag->defg
+A_blocks: 57
+B_blocks: 25
+A_rank: 3
+B_rank: 3

@@ -1,0 +1,53 @@
+diff --git a/include/cutlass/epilogue/threadblock/predicated_tile_iterator.h b/include/cutlass/epilogue/threadblock/predicated_tile_iterator.h
+index 2502c2e0..2d85dfd5 100644
+--- a/include/cutlass/epilogue/threadblock/predicated_tile_iterator.h
++++ b/include/cutlass/epilogue/threadblock/predicated_tile_iterator.h
+@@ -345,31 +345,43 @@ public:
+ 
+             bool guard = row_guard && mask_.predicates[column];
+ 
++            if (PermuteD) {
++              int col_offset = column * ThreadMap::Delta::kColumn;
++              int col = col_offset + thread_start_column_;
++              int row = row_offset + thread_start_row_;
++              memory_pointer = reinterpret_cast<AccessType *>(store_byte_pointer_ + byte_offset
++                 + permute_layout_(PitchLinearCoord(col, row)) * sizeof(AccessType) / kElementsPerAccess);
++            }
++
+             cutlass::arch::global_load<
+               AccessType,
+               sizeof(AccessType)
+             >(
+                 frag_ptr[frag_row_idx * ThreadMap::Iterations::kColumn +
+                          column],
+-                (void *)&memory_pointer[column * ThreadMap::Delta::kColumn /
+-                                        kElementsPerAccess],
++                (void *)&memory_pointer[PermuteD ? 0 : (column * ThreadMap::Delta::kColumn /
++                                        kElementsPerAccess)],
+                 guard);
+           }
+ 
+           if (row + 1 < ThreadMap::Iterations::kRow) {
+-            if (!ScatterD) {
++            if (!ScatterD && !PermuteD) {
+               byte_pointer += params_.increment_row;
+             }
+           }
+         }
+ 
+         if (group + 1 < ThreadMap::Iterations::kGroup) {
+-          byte_pointer += params_.increment_group;
++          if (!PermuteD) {
++            byte_pointer += params_.increment_group;
++          }
+         }
+       }
+ 
+       if (cluster + 1 < ThreadMap::Iterations::kCluster) {
+-        byte_pointer += params_.increment_cluster;
++        if (!PermuteD) {
++          byte_pointer += params_.increment_cluster;
++        }
+       }
+     }
+   }

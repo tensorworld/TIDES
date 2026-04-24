@@ -1,0 +1,20 @@
+# -----------------
+# Tensor B (ea)
+# Converted from cutensor_data format
+# -----------------
+# Number of sections {e, a}
+{13, 9}
+# Number of non-zero blocks (nnz)
+9
+# Block sizes per dimension
+{15, 143, 638, 1795, 3559, 5200, 5669, 4575, 2659, 1055, 259, 32, 1, 2, 43, 159, 331, 430, 360, 200, 65, 9}
+# Non-zero block coordinates (0-indexed)
+10, 0
+9, 1
+8, 2
+7, 3
+6, 4
+5, 5
+4, 6
+3, 7
+2, 8

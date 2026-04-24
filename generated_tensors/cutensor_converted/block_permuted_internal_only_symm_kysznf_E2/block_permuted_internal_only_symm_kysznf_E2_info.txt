@@ -1,0 +1,5 @@
+einsum: ade,afg->defg
+A_blocks: 3225
+B_blocks: 66
+A_rank: 3
+B_rank: 3

@@ -1,0 +1,13 @@
+# -----------------
+# Tensor B (ah)
+# Converted from cutensor_data format
+# -----------------
+# Number of sections {a, h}
+{2, 2}
+# Number of non-zero blocks (nnz)
+2
+# Block sizes per dimension
+{15984, 15996, 801, 798}
+# Non-zero block coordinates (0-indexed)
+0, 0
+1, 1

@@ -1,0 +1,5 @@
+einsum: dae,fga->defg
+A_blocks: 6
+B_blocks: 6
+A_rank: 3
+B_rank: 3

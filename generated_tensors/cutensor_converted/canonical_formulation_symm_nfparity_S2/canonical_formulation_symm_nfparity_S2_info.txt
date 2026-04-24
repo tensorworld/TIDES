@@ -1,0 +1,5 @@
+einsum: dea,fagh->defgh
+A_blocks: 8
+B_blocks: 18
+A_rank: 3
+B_rank: 4

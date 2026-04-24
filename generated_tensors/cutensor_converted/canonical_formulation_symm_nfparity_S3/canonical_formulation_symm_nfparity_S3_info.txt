@@ -1,0 +1,5 @@
+einsum: fbghai,baj->fghij
+A_blocks: 144
+B_blocks: 8
+A_rank: 6
+B_rank: 3

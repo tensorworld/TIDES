@@ -1,0 +1,5 @@
+einsum: fbag,bhai->fghi
+A_blocks: 24
+B_blocks: 36
+A_rank: 4
+B_rank: 4

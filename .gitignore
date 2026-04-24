@@ -1,0 +1,59 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+/Makefile
+
+# Object files and generated binaries
+*.o
+*.obj
+*.ptx
+*.cubin
+*.fatbin
+*.d
+/a.out
+/a.out.*
+/bsptc
+/grouped_gemm
+/main
+/tensor_generator
+/tensor_generator.bin
+
+# Profiling and logs
+*.ncu-rep
+*.nsys-rep
+*.nvvp
+*.log
+*.tmp
+
+# Run outputs
+/results/
+/logs/
+generated_tensors/**/run_results*.csv
+
+# Editor / IDE cruft
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+.cache/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+.venv
+
+# Vendored cuTENSOR install (users install locally)
+/libcutensor
+/libcutensor-*
+
+# Agent / AI config
+.claude/
+CLAUDE.md
+AGENTS.md

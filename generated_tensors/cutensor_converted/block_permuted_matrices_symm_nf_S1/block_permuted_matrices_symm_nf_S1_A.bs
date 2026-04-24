@@ -1,0 +1,20 @@
+# -----------------
+# Tensor A (ad)
+# Converted from cutensor_data format
+# -----------------
+# Number of sections {a, d}
+{9, 11}
+# Number of non-zero blocks (nnz)
+9
+# Block sizes per dimension
+{6, 47, 181, 350, 431, 350, 182, 47, 6, 2, 47, 247, 692, 1251, 1551, 1350, 825, 339, 83, 9}
+# Non-zero block coordinates (0-indexed)
+8, 1
+7, 2
+6, 3
+5, 4
+4, 5
+3, 6
+2, 7
+1, 8
+0, 9

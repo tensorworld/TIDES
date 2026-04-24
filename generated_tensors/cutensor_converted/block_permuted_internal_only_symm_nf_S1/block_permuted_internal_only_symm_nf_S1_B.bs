@@ -1,0 +1,36 @@
+# -----------------
+# Tensor B (afg)
+# Converted from cutensor_data format
+# -----------------
+# Number of sections {a, f, g}
+{9, 3, 9}
+# Number of non-zero blocks (nnz)
+25
+# Block sizes per dimension
+{6, 47, 181, 350, 431, 350, 182, 47, 6, 1, 2, 1, 15, 83, 216, 373, 424, 319, 141, 28, 1}
+# Non-zero block coordinates (0-indexed)
+0, 1, 0
+1, 2, 0
+0, 0, 1
+1, 1, 1
+2, 2, 1
+1, 0, 2
+2, 1, 2
+3, 2, 2
+2, 0, 3
+3, 1, 3
+4, 2, 3
+3, 0, 4
+4, 1, 4
+5, 2, 4
+4, 0, 5
+5, 1, 5
+6, 2, 5
+5, 0, 6
+6, 1, 6
+7, 2, 6
+6, 0, 7
+7, 1, 7
+8, 2, 7
+7, 0, 8
+8, 1, 8

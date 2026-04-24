@@ -1,0 +1,5 @@
+einsum: ad,ea->de
+A_blocks: 40
+B_blocks: 34
+A_rank: 2
+B_rank: 2

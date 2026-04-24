@@ -1,0 +1,17 @@
+# -----------------
+# Tensor B (fga)
+# Converted from cutensor_data format
+# -----------------
+# Number of sections {f, g, a}
+{3, 2, 2}
+# Number of non-zero blocks (nnz)
+6
+# Block sizes per dimension
+{1, 2, 1, 801, 798, 805, 794}
+# Non-zero block coordinates (0-indexed)
+0, 0, 0
+2, 0, 0
+1, 1, 0
+1, 0, 1
+0, 1, 1
+2, 1, 1
