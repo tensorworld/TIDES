@@ -3,6 +3,7 @@
 #include "coord_key.hpp"
 #include "gpu_sparse_device.cuh"
 #include "gpu_sparse_input.hpp"
+#include "hash_tables.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -23,18 +24,6 @@ static constexpr uint8_t kOBHasLarge    = 0x04;  // has CUTLASS-tier pairs
 static constexpr uint8_t kOBMultiSmall  = 0x08;  // >1 small pair for this output block
 static constexpr uint8_t kOBMultiMedium = 0x10;  // >1 medium pair for this output block
 static constexpr uint8_t kOBMultiLarge  = 0x20;  // >1 large pair for this output block
-
-// 16-byte sort key: hash + pair index. Fits in cache for fast sorting.
-struct alignas(16) HashEntry {
-    uint64_t hash;
-    int32_t pair_idx;
-};
-
-// FNV-1a hash combine
-inline void hash_combine(uint64_t& hash, int32_t val) {
-    hash ^= static_cast<uint64_t>(static_cast<uint32_t>(val));
-    hash *= 1099511628211ULL;
-}
 
 // Pre-computed output block structure.
 // Built once from A×B pair info; reusable across iterations when the
@@ -133,33 +122,66 @@ OutputBlockMap compute_output_blocks(
 
 // Accumulation map: maps each pair to its destination offset in the final output.
 // Not templated on T (only stores offsets/indices).
+// Owns its arrays: move-only, destructor releases host and device memory.
 struct AccumulationMap {
-    // Host arrays (heap-allocated, not std::vector)
-    int64_t* h_dest_offsets;          // [num_pairs] per-pair dest offset in final output
-    int32_t* h_pair_reuse_counts;     // [num_pairs] total writes to pair's output block
-    int64_t* h_pair_output_block_idx; // [num_pairs] output block index for this pair
-    int32_t* h_output_block_coords;   // [num_output_blocks * output_rank] flat
-    int64_t* h_output_block_offsets;  // [num_output_blocks] offset of each output block
-    int64_t* h_output_block_volumes;  // [num_output_blocks] volume of each output block
-    int64_t* h_output_pair_offsets;   // [num_output_blocks + 1] flattened pair list offsets
-    int64_t* h_output_pair_indices;   // [num_pairs] flattened pair indices by output block
-    uint8_t* h_ob_tier_flags;         // [num_output_blocks] per-OB tier presence bitfield
+    // Host arrays (raw new[] — deliberately uninitialized; every entry is
+    // written by the fill passes, so no vector zero-init cost at scale)
+    int64_t* h_dest_offsets = nullptr;          // [num_pairs] per-pair dest offset in final output
+    int64_t* h_pair_output_block_idx = nullptr; // [num_pairs] output block index for this pair
+    int32_t* h_output_block_coords = nullptr;   // [num_output_blocks * output_rank] flat
+    int64_t* h_output_block_offsets = nullptr;  // [num_output_blocks] offset of each output block
+    int64_t* h_output_block_volumes = nullptr;  // [num_output_blocks] volume of each output block
+    int64_t* h_output_pair_offsets = nullptr;   // [num_output_blocks + 1] flattened pair list offsets
+    int64_t* h_output_pair_indices = nullptr;   // [num_pairs] flattened pair indices by output block
+    uint8_t* h_ob_tier_flags = nullptr;         // [num_output_blocks] per-OB tier presence bitfield
 
-    // Device copy
-    int64_t* d_dest_offsets;          // device copy of h_dest_offsets
+    int64_t total_output_elements = 0;
+    int64_t num_output_blocks = 0;
+    int64_t num_pairs = 0;
+    dim_t output_rank = 0;
 
-    int64_t total_output_elements;
-    int64_t num_output_blocks;
-    int64_t num_pairs;
-    dim_t output_rank;
+    AccumulationMap() = default;
+    AccumulationMap(const AccumulationMap&) = delete;
+    AccumulationMap& operator=(const AccumulationMap&) = delete;
+    AccumulationMap(AccumulationMap&& o) noexcept { swap(o); }
+    AccumulationMap& operator=(AccumulationMap&& o) noexcept {
+        if (this != &o) { release(); swap(o); }
+        return *this;
+    }
+    ~AccumulationMap() { release(); }
+
+    void swap(AccumulationMap& o) noexcept {
+        std::swap(h_dest_offsets, o.h_dest_offsets);
+        std::swap(h_pair_output_block_idx, o.h_pair_output_block_idx);
+        std::swap(h_output_block_coords, o.h_output_block_coords);
+        std::swap(h_output_block_offsets, o.h_output_block_offsets);
+        std::swap(h_output_block_volumes, o.h_output_block_volumes);
+        std::swap(h_output_pair_offsets, o.h_output_pair_offsets);
+        std::swap(h_output_pair_indices, o.h_output_pair_indices);
+        std::swap(h_ob_tier_flags, o.h_ob_tier_flags);
+        std::swap(total_output_elements, o.total_output_elements);
+        std::swap(num_output_blocks, o.num_output_blocks);
+        std::swap(num_pairs, o.num_pairs);
+        std::swap(output_rank, o.output_rank);
+    }
+
+    void release() noexcept {
+        delete[] h_dest_offsets;          h_dest_offsets = nullptr;
+        delete[] h_pair_output_block_idx; h_pair_output_block_idx = nullptr;
+        delete[] h_output_block_coords;   h_output_block_coords = nullptr;
+        delete[] h_output_block_offsets;  h_output_block_offsets = nullptr;
+        delete[] h_output_block_volumes;  h_output_block_volumes = nullptr;
+        delete[] h_output_pair_offsets;   h_output_pair_offsets = nullptr;
+        delete[] h_output_pair_indices;   h_output_pair_indices = nullptr;
+        delete[] h_ob_tier_flags;         h_ob_tier_flags = nullptr;
+    }
 };
 
 // Reduction plan for temp-buffer pairs (large + medium):
 // - direct-write singleton CUTLASS outputs to final output
 // - reduce multi-write output blocks with a no-atomic kernel
+// Owns its arrays: move-only, destructor releases host and device memory.
 struct ReductionPlan {
-    int64_t num_pairs = 0;
-
     // Host flags per original pair index
     uint8_t* h_direct_write = nullptr;  // [num_pairs], 1 if CUTLASS singleton
 
@@ -175,11 +197,100 @@ struct ReductionPlan {
     int64_t* d_reduce_volumes = nullptr;
     int64_t* d_reduce_src_offsets = nullptr;
     int64_t* d_reduce_src_ptrs = nullptr;
+
+    ReductionPlan() = default;
+    ReductionPlan(const ReductionPlan&) = delete;
+    ReductionPlan& operator=(const ReductionPlan&) = delete;
+    ReductionPlan(ReductionPlan&& o) noexcept { swap(o); }
+    ReductionPlan& operator=(ReductionPlan&& o) noexcept {
+        if (this != &o) { release(); swap(o); }
+        return *this;
+    }
+    ~ReductionPlan() { release(); }
+
+    void swap(ReductionPlan& o) noexcept {
+        std::swap(h_direct_write, o.h_direct_write);
+        std::swap(num_reduce_groups, o.num_reduce_groups);
+        std::swap(h_reduce_dest_offsets, o.h_reduce_dest_offsets);
+        std::swap(h_reduce_volumes, o.h_reduce_volumes);
+        std::swap(h_reduce_src_offsets, o.h_reduce_src_offsets);
+        std::swap(h_reduce_src_ptrs, o.h_reduce_src_ptrs);
+        std::swap(d_reduce_dest_offsets, o.d_reduce_dest_offsets);
+        std::swap(d_reduce_volumes, o.d_reduce_volumes);
+        std::swap(d_reduce_src_offsets, o.d_reduce_src_offsets);
+        std::swap(d_reduce_src_ptrs, o.d_reduce_src_ptrs);
+    }
+
+    void release() noexcept {
+        delete[] h_direct_write;         h_direct_write = nullptr;
+        delete[] h_reduce_dest_offsets;  h_reduce_dest_offsets = nullptr;
+        delete[] h_reduce_volumes;       h_reduce_volumes = nullptr;
+        delete[] h_reduce_src_offsets;   h_reduce_src_offsets = nullptr;
+        delete[] h_reduce_src_ptrs;      h_reduce_src_ptrs = nullptr;
+        if (d_reduce_dest_offsets) { cudaFree(d_reduce_dest_offsets); d_reduce_dest_offsets = nullptr; }
+        if (d_reduce_volumes)      { cudaFree(d_reduce_volumes);      d_reduce_volumes = nullptr; }
+        if (d_reduce_src_offsets)  { cudaFree(d_reduce_src_offsets);  d_reduce_src_offsets = nullptr; }
+        if (d_reduce_src_ptrs)     { cudaFree(d_reduce_src_ptrs);     d_reduce_src_ptrs = nullptr; }
+    }
 };
 
+// Allocate the host arrays of an AccumulationMap sized for
+// num_pairs/num_output_blocks/output_rank (all already set on `map`).
+inline void alloc_accumulation_map_arrays(AccumulationMap& map, bool want_tier_flags) {
+    const int64_t np = map.num_pairs;
+    const int64_t nob = map.num_output_blocks;
+    map.h_dest_offsets = new int64_t[np];
+    map.h_pair_output_block_idx = new int64_t[np];
+    map.h_output_block_coords = new int32_t[nob * map.output_rank];
+    map.h_output_block_offsets = new int64_t[nob];
+    map.h_output_block_volumes = new int64_t[nob];
+    map.h_output_pair_offsets = new int64_t[nob + 1];
+    map.h_output_pair_indices = new int64_t[np];
+    if (want_tier_flags) {
+        map.h_ob_tier_flags = new uint8_t[nob];
+        std::memset(map.h_ob_tier_flags, 0, static_cast<size_t>(nob) * sizeof(uint8_t));
+    }
+}
+
+// Shared tail of both compute_accumulation_map overloads. Requires
+// h_pair_output_block_idx and the block-level arrays (coords, offsets,
+// volumes) to be filled; derives dest offsets, the grouped pair-index
+// lists, and (when work_tier is given) the per-OB tier flags.
+inline void fill_accumulation_pair_arrays(AccumulationMap& map, const uint8_t* work_tier) {
+    const int64_t np = map.num_pairs;
+    const int64_t nob = map.num_output_blocks;
+
+    std::vector<int32_t> pairs_per_block(static_cast<size_t>(nob), 0);
+    for (int64_t i = 0; i < np; ++i)
+        pairs_per_block[static_cast<size_t>(map.h_pair_output_block_idx[i])]++;
+
+    int64_t pair_cursor = 0;
+    for (int64_t ob = 0; ob < nob; ++ob) {
+        map.h_output_pair_offsets[ob] = pair_cursor;
+        pair_cursor += pairs_per_block[static_cast<size_t>(ob)];
+    }
+    map.h_output_pair_offsets[nob] = pair_cursor;
+
+    std::vector<int32_t> cursor(static_cast<size_t>(nob), 0);
+    for (int64_t i = 0; i < np; ++i) {
+        const int64_t ob = map.h_pair_output_block_idx[i];
+        map.h_dest_offsets[i] = map.h_output_block_offsets[ob];
+        const int64_t slot = map.h_output_pair_offsets[ob] + cursor[static_cast<size_t>(ob)]++;
+        map.h_output_pair_indices[slot] = i;
+        if (work_tier) {
+            const uint8_t t = work_tier[i];
+            uint8_t& flags = map.h_ob_tier_flags[ob];
+            const uint8_t has = static_cast<uint8_t>(kOBHasSmall << t);
+            flags |= (flags & has) ? static_cast<uint8_t>(has << 3) : has;
+        }
+    }
+}
+
 // Compute the accumulation map from host-side pair info.
-// Groups pairs by output block coordinate using hash-accelerated sort.
-// Output blocks are grouped deterministically but not in lexicographic order.
+// Groups pairs by output block coordinate via O(n) hash grouping
+// (group_coord_rows, gtl Swiss table in the gtl-isolated hash_tables TU).
+// Output blocks are ordered by first occurrence in pair order — the same
+// contract as the precomputed-OutputBlockMap path below.
 template <typename T>
 AccumulationMap compute_accumulation_map(
     const BlockPairInfo* pairs_host,
@@ -192,146 +303,54 @@ AccumulationMap compute_accumulation_map(
     AccumulationMap map;
     map.num_pairs = num_pairs;
     map.output_rank = config.output_rank;
-    map.d_dest_offsets = nullptr;
     map.h_ob_tier_flags = nullptr;
 
     const int32_t rank = config.output_rank;
 
     // Flat coordinate storage: [num_pairs * rank], tightly packed
     std::vector<int32_t> flat_coords(num_pairs * rank);
-    std::vector<HashEntry> entries(num_pairs);
-
-    // Generate coordinates and hashes
     for (int64_t i = 0; i < num_pairs; ++i) {
-        int32_t* coord_out = &flat_coords[i * rank];
-        uint64_t hash = 14695981039346656037ULL; // FNV offset basis
+        int32_t* coord_out = flat_coords.data() + i * rank;
         int32_t pos = 0;
-
-        for (int32_t b = 0; b < config.num_batch; ++b) {
-            int32_t val = A_gpu.block_coords[pairs_host[i].block_idx_A * A_gpu.rank + config.batch_pos_A[b]];
-            coord_out[pos++] = val;
-            hash_combine(hash, val);
-        }
-        for (int32_t f = 0; f < config.num_free_A; ++f) {
-            int32_t val = A_gpu.block_coords[pairs_host[i].block_idx_A * A_gpu.rank + config.free_pos_A[f]];
-            coord_out[pos++] = val;
-            hash_combine(hash, val);
-        }
-        for (int32_t f = 0; f < config.num_free_B; ++f) {
-            int32_t val = B_gpu.block_coords[pairs_host[i].block_idx_B * B_gpu.rank + config.free_pos_B[f]];
-            coord_out[pos++] = val;
-            hash_combine(hash, val);
-        }
-
-        entries[i] = {hash, static_cast<int32_t>(i)};
+        for (int32_t b = 0; b < config.num_batch; ++b)
+            coord_out[pos++] = A_gpu.block_coords[pairs_host[i].block_idx_A * A_gpu.rank + config.batch_pos_A[b]];
+        for (int32_t f = 0; f < config.num_free_A; ++f)
+            coord_out[pos++] = A_gpu.block_coords[pairs_host[i].block_idx_A * A_gpu.rank + config.free_pos_A[f]];
+        for (int32_t f = 0; f < config.num_free_B; ++f)
+            coord_out[pos++] = B_gpu.block_coords[pairs_host[i].block_idx_B * B_gpu.rank + config.free_pos_B[f]];
     }
 
-    // Sort by hash; fall back to coordinate comparison on collision
-    std::sort(entries.begin(), entries.end(), [&](const HashEntry& a, const HashEntry& b) {
-        if (a.hash != b.hash) return a.hash < b.hash;
-        const int32_t* c_a = &flat_coords[a.pair_idx * rank];
-        const int32_t* c_b = &flat_coords[b.pair_idx * rank];
-        for (int32_t d = 0; d < rank; ++d) {
-            if (c_a[d] != c_b[d]) return c_a[d] < c_b[d];
-        }
-        return a.pair_idx < b.pair_idx;
-    });
-
-    // Count output blocks (group boundaries)
-    int64_t num_output_blocks = 0;
-    for (int64_t i = 0; i < num_pairs; ) {
-        int64_t j = i + 1;
-        while (j < num_pairs && entries[i].hash == entries[j].hash) {
-            const int32_t* c_base = &flat_coords[entries[i].pair_idx * rank];
-            const int32_t* c_j = &flat_coords[entries[j].pair_idx * rank];
-            bool eq = true;
-            for (int32_t d = 0; d < rank; ++d) {
-                if (c_base[d] != c_j[d]) { eq = false; break; }
-            }
-            if (!eq) break;
-            j++;
-        }
-        num_output_blocks++;
-        i = j;
-    }
+    std::vector<int32_t> group_of(static_cast<size_t>(num_pairs));
+    const int64_t num_output_blocks = group_coord_rows(
+        flat_coords.data(), num_pairs, rank, group_of.data());
     map.num_output_blocks = num_output_blocks;
 
-    // Allocate host arrays
-    map.h_dest_offsets = new int64_t[num_pairs];
-    map.h_pair_reuse_counts = new int32_t[num_pairs];
-    map.h_pair_output_block_idx = new int64_t[num_pairs];
-    map.h_output_block_coords = new int32_t[num_output_blocks * rank];
-    map.h_output_block_offsets = new int64_t[num_output_blocks];
-    map.h_output_block_volumes = new int64_t[num_output_blocks];
-    map.h_output_pair_offsets = new int64_t[num_output_blocks + 1];
-    map.h_output_pair_indices = new int64_t[num_pairs];
-    if (work_tier) {
-        map.h_ob_tier_flags = new uint8_t[num_output_blocks];
-        std::memset(map.h_ob_tier_flags, 0, num_output_blocks * sizeof(uint8_t));
+    alloc_accumulation_map_arrays(map, work_tier != nullptr);
+
+    // Assign pairs to blocks; remember each block's first pair (coords + volume)
+    std::vector<int32_t> first_pair(static_cast<size_t>(num_output_blocks), -1);
+    for (int64_t i = 0; i < num_pairs; ++i) {
+        const int32_t ob = group_of[static_cast<size_t>(i)];
+        map.h_pair_output_block_idx[i] = ob;
+        if (first_pair[static_cast<size_t>(ob)] < 0)
+            first_pair[static_cast<size_t>(ob)] = static_cast<int32_t>(i);
     }
 
-    // Group and reduce: single pass over sorted entries
+    // Block-level arrays + offset prefix sum
     int64_t current_offset = 0;
-    int64_t block_idx = 0;
-    int64_t pair_cursor = 0;
-
-    for (int64_t i = 0; i < num_pairs; ) {
-        const int32_t base_pair_idx = entries[i].pair_idx;
-        const int32_t* base_coord = &flat_coords[base_pair_idx * rank];
-
-        // Find end of group
-        int64_t j = i + 1;
-        while (j < num_pairs && entries[i].hash == entries[j].hash) {
-            const int32_t* c_j = &flat_coords[entries[j].pair_idx * rank];
-            bool eq = true;
-            for (int32_t d = 0; d < rank; ++d) {
-                if (base_coord[d] != c_j[d]) { eq = false; break; }
-            }
-            if (!eq) break;
-            j++;
-        }
-
-        const int32_t reuse = static_cast<int32_t>(j - i);
-        const int64_t volume = pairs_host[base_pair_idx].output_volume;
-
-        // Store block coordinate
-        for (int32_t d = 0; d < rank; ++d) {
-            map.h_output_block_coords[block_idx * rank + d] = base_coord[d];
-        }
-        map.h_output_block_offsets[block_idx] = current_offset;
-        map.h_output_block_volumes[block_idx] = volume;
-        map.h_output_pair_offsets[block_idx] = pair_cursor;
-
-        // Assign all pairs in this group
-        int tier_count[3] = {0, 0, 0};
-        for (int64_t k = i; k < j; ++k) {
-            const int64_t p_idx = entries[k].pair_idx;
-            map.h_dest_offsets[p_idx] = current_offset;
-            map.h_pair_output_block_idx[p_idx] = block_idx;
-            map.h_pair_reuse_counts[p_idx] = reuse;
-            map.h_output_pair_indices[pair_cursor++] = p_idx;
-            if (work_tier) tier_count[work_tier[p_idx]]++;
-        }
-
-        // Set per-output-block tier flags
-        if (work_tier) {
-            uint8_t flags = 0;
-            if (tier_count[0] > 0) flags |= kOBHasSmall;
-            if (tier_count[1] > 0) flags |= kOBHasMedium;
-            if (tier_count[2] > 0) flags |= kOBHasLarge;
-            if (tier_count[0] > 1) flags |= kOBMultiSmall;
-            if (tier_count[1] > 1) flags |= kOBMultiMedium;
-            if (tier_count[2] > 1) flags |= kOBMultiLarge;
-            map.h_ob_tier_flags[block_idx] = flags;
-        }
-
+    for (int64_t ob = 0; ob < num_output_blocks; ++ob) {
+        const int32_t fp = first_pair[static_cast<size_t>(ob)];
+        std::memcpy(map.h_output_block_coords + ob * rank,
+                    flat_coords.data() + static_cast<int64_t>(fp) * rank,
+                    static_cast<size_t>(rank) * sizeof(int32_t));
+        const int64_t volume = pairs_host[fp].output_volume;
+        map.h_output_block_offsets[ob] = current_offset;
+        map.h_output_block_volumes[ob] = volume;
         current_offset += volume;
-        block_idx++;
-        i = j;
     }
-    map.h_output_pair_offsets[num_output_blocks] = pair_cursor;
-
     map.total_output_elements = current_offset;
+
+    fill_accumulation_pair_arrays(map, work_tier);
     return map;
 }
 
@@ -350,26 +369,13 @@ AccumulationMap compute_accumulation_map(
     AccumulationMap map;
     map.num_pairs = num_pairs;
     map.output_rank = config.output_rank;
-    map.d_dest_offsets = nullptr;
     map.h_ob_tier_flags = nullptr;
 
     const int32_t rank = config.output_rank;
     const int64_t nob = obm.num_blocks;
     map.num_output_blocks = nob;
 
-    // Allocate host arrays
-    map.h_dest_offsets = new int64_t[num_pairs];
-    map.h_pair_reuse_counts = new int32_t[num_pairs];
-    map.h_pair_output_block_idx = new int64_t[num_pairs];
-    map.h_output_block_coords = new int32_t[nob * rank];
-    map.h_output_block_offsets = new int64_t[nob];
-    map.h_output_block_volumes = new int64_t[nob];
-    map.h_output_pair_offsets = new int64_t[nob + 1];
-    map.h_output_pair_indices = new int64_t[num_pairs];
-    if (work_tier) {
-        map.h_ob_tier_flags = new uint8_t[nob];
-        std::memset(map.h_ob_tier_flags, 0, static_cast<size_t>(nob) * sizeof(uint8_t));
-    }
+    alloc_accumulation_map_arrays(map, work_tier != nullptr);
 
     // Copy block-level data from OutputBlockMap
     std::memcpy(map.h_output_block_coords, obm.block_coords.data(),
@@ -379,125 +385,64 @@ AccumulationMap compute_accumulation_map(
     std::memcpy(map.h_output_block_volumes, obm.block_volumes.data(),
                 static_cast<size_t>(nob) * sizeof(int64_t));
 
-    // Pass 1: assign each pair to its output block via hash lookup
-    std::vector<int32_t> pairs_per_block(static_cast<size_t>(nob), 0);
+    // Assign each pair to its output block via hash lookup.
+    // Per-pair find into the nob-entry map beats O(n) Swiss-table grouping
+    // here: the map is small enough to stay cache-resident, while grouping
+    // builds an num_pairs-entry table (measured slower at 524k pairs).
     for (int64_t i = 0; i < num_pairs; ++i) {
         auto key = extract_output_key(pairs_host[i], A_gpu, B_gpu, config);
-
         auto it = obm.coord_to_idx.find(key);
-        const int32_t ob = it->second;
-        map.h_pair_output_block_idx[i] = ob;
-        map.h_dest_offsets[i] = obm.block_offsets[static_cast<size_t>(ob)];
-        pairs_per_block[static_cast<size_t>(ob)]++;
-    }
-
-    // Set reuse counts from pairs_per_block
-    for (int64_t i = 0; i < num_pairs; ++i) {
-        map.h_pair_reuse_counts[i] =
-            pairs_per_block[static_cast<size_t>(map.h_pair_output_block_idx[i])];
-    }
-
-    // Prefix sum for pair list offsets
-    int64_t pair_offset = 0;
-    for (int64_t ob = 0; ob < nob; ++ob) {
-        map.h_output_pair_offsets[ob] = pair_offset;
-        pair_offset += pairs_per_block[static_cast<size_t>(ob)];
-    }
-    map.h_output_pair_offsets[nob] = pair_offset;
-
-    // Fill pair indices grouped by output block
-    std::vector<int32_t> cursor(static_cast<size_t>(nob), 0);
-    for (int64_t i = 0; i < num_pairs; ++i) {
-        const int64_t ob = map.h_pair_output_block_idx[i];
-        const int64_t slot = map.h_output_pair_offsets[ob] + cursor[static_cast<size_t>(ob)]++;
-        map.h_output_pair_indices[slot] = i;
-    }
-
-    // Tier flags
-    if (work_tier) {
-        for (int64_t ob = 0; ob < nob; ++ob) {
-            int tier_count[3] = {0, 0, 0};
-            const int64_t begin = map.h_output_pair_offsets[ob];
-            const int64_t end = map.h_output_pair_offsets[ob + 1];
-            for (int64_t j = begin; j < end; ++j)
-                tier_count[work_tier[map.h_output_pair_indices[j]]]++;
-            uint8_t flags = 0;
-            if (tier_count[0] > 0) flags |= kOBHasSmall;
-            if (tier_count[1] > 0) flags |= kOBHasMedium;
-            if (tier_count[2] > 0) flags |= kOBHasLarge;
-            if (tier_count[0] > 1) flags |= kOBMultiSmall;
-            if (tier_count[1] > 1) flags |= kOBMultiMedium;
-            if (tier_count[2] > 1) flags |= kOBMultiLarge;
-            map.h_ob_tier_flags[static_cast<size_t>(ob)] = flags;
-        }
+        if (it == obm.coord_to_idx.end())
+            throw std::runtime_error(
+                "compute_accumulation_map: a block pair produces an output "
+                "block absent from the provided OutputBlockMap (caller output "
+                "metadata is inconsistent with the inputs)");
+        map.h_pair_output_block_idx[i] = it->second;
     }
 
     map.total_output_elements = obm.total_elements;
+
+    fill_accumulation_pair_arrays(map, work_tier);
     return map;
 }
 
-// Upload accumulation map to device (only d_dest_offsets needed on GPU)
-inline void upload_accumulation_map(AccumulationMap& map, cudaStream_t stream = 0) {
-    if (map.num_pairs > 0) {
-        check_cuda(cudaMalloc(&map.d_dest_offsets,
-                              map.num_pairs * sizeof(int64_t)),
-                   "malloc d_dest_offsets");
-        check_cuda(cudaMemcpyAsync(map.d_dest_offsets, map.h_dest_offsets,
-                                    map.num_pairs * sizeof(int64_t),
-                                    cudaMemcpyHostToDevice, stream),
-                   "memcpy d_dest_offsets");
+// Direct-write eligibility, computed ONCE per plan: a temp-tier (CUTLASS)
+// pair may bypass the temp buffer when it is the sole temp-tier writer of its
+// output block AND the block is not mixed (kOBHasLarge & kOBHasMedium —
+// volume pairs write d_output concurrently). Consumed by both
+// plan_temp_buffer_offsets (skip temp slots) and build_reduction_plan
+// (h_direct_write + reduce groups), which previously each recomputed it.
+// pair_tier: 0 = warp/volume (d_output), nonzero = temp tier.
+inline std::vector<uint8_t> compute_direct_write_eligibility(
+    const AccumulationMap& map,
+    const std::vector<uint8_t>& pair_tier)
+{
+    const size_t np = pair_tier.size();
+    const size_t nob = static_cast<size_t>(map.num_output_blocks);
+    std::vector<uint8_t> is_direct(np, 0);
+    if (np == 0 || nob == 0) return is_direct;
+
+    std::vector<int64_t> tb_count(nob, 0);
+    for (size_t p = 0; p < np; ++p)
+        if (pair_tier[p] != 0)
+            tb_count[static_cast<size_t>(map.h_pair_output_block_idx[p])]++;
+
+    for (size_t ob = 0; ob < nob; ++ob) {
+        if (tb_count[ob] != 1) continue;
+        if (map.h_ob_tier_flags &&
+            (map.h_ob_tier_flags[ob] & (kOBHasLarge | kOBHasMedium)) ==
+            (kOBHasLarge | kOBHasMedium)) continue;
+        const int64_t begin = map.h_output_pair_offsets[ob];
+        const int64_t end = map.h_output_pair_offsets[ob + 1];
+        for (int64_t i = begin; i < end; ++i) {
+            const int64_t pi = map.h_output_pair_indices[i];
+            if (pair_tier[static_cast<size_t>(pi)] != 0) {
+                is_direct[static_cast<size_t>(pi)] = 1;
+                break;
+            }
+        }
     }
-}
-
-// Free all accumulation map memory
-inline void free_accumulation_map(AccumulationMap& map) {
-    delete[] map.h_dest_offsets;
-    delete[] map.h_pair_reuse_counts;
-    delete[] map.h_pair_output_block_idx;
-    delete[] map.h_output_block_coords;
-    delete[] map.h_output_block_offsets;
-    delete[] map.h_output_block_volumes;
-    delete[] map.h_output_pair_offsets;
-    delete[] map.h_output_pair_indices;
-    delete[] map.h_ob_tier_flags;
-    map.h_dest_offsets = nullptr;
-    map.h_pair_reuse_counts = nullptr;
-    map.h_pair_output_block_idx = nullptr;
-    map.h_output_block_coords = nullptr;
-    map.h_output_block_offsets = nullptr;
-    map.h_output_block_volumes = nullptr;
-    map.h_output_pair_offsets = nullptr;
-    map.h_output_pair_indices = nullptr;
-    map.h_ob_tier_flags = nullptr;
-
-    if (map.d_dest_offsets) {
-        cudaFree(map.d_dest_offsets);
-        map.d_dest_offsets = nullptr;
-    }
-}
-
-inline void free_reduction_plan(ReductionPlan& plan) {
-    delete[] plan.h_direct_write;
-    delete[] plan.h_reduce_dest_offsets;
-    delete[] plan.h_reduce_volumes;
-    delete[] plan.h_reduce_src_offsets;
-    delete[] plan.h_reduce_src_ptrs;
-    plan.h_direct_write = nullptr;
-    plan.h_reduce_dest_offsets = nullptr;
-    plan.h_reduce_volumes = nullptr;
-    plan.h_reduce_src_offsets = nullptr;
-    plan.h_reduce_src_ptrs = nullptr;
-
-    if (plan.d_reduce_dest_offsets) { cudaFree(plan.d_reduce_dest_offsets); }
-    if (plan.d_reduce_volumes) { cudaFree(plan.d_reduce_volumes); }
-    if (plan.d_reduce_src_offsets) { cudaFree(plan.d_reduce_src_offsets); }
-    if (plan.d_reduce_src_ptrs) { cudaFree(plan.d_reduce_src_ptrs); }
-    plan.d_reduce_dest_offsets = nullptr;
-    plan.d_reduce_volumes = nullptr;
-    plan.d_reduce_src_offsets = nullptr;
-    plan.d_reduce_src_ptrs = nullptr;
-    plan.num_pairs = 0;
-    plan.num_reduce_groups = 0;
+    return is_direct;
 }
 
 // Build reduction plan for the CUTLASS tier (only tier using temp buffer):
@@ -505,17 +450,14 @@ inline void free_reduction_plan(ReductionPlan& plan) {
 // - output blocks with >1 temp-buffer pairs become no-atomic reduction groups
 // pair_tier: 0 = warp/volume (write to d_output, no temp buffer),
 //            2 = CUTLASS (temp buffer, eligible for direct-write singleton).
-// ob_tier_flags: per-output-block tier bitfield (h_ob_tier_flags from AccumulationMap).
-//   CUTLASS pairs on mixed blocks (kOBHasLarge & kOBHasMedium) must NOT direct-write
-//   because volume pairs write to d_output concurrently.  May be nullptr (no mixed blocks).
+// is_direct: precomputed by compute_direct_write_eligibility (same pair_tier).
 inline ReductionPlan build_reduction_plan(
     const AccumulationMap& map,
     const std::vector<uint8_t>& pair_tier,
-    const BlockPairInfo* pairs_host,
-    const uint8_t* ob_tier_flags = nullptr)
+    const std::vector<uint8_t>& is_direct,
+    const BlockPairInfo* pairs_host)
 {
     ReductionPlan plan;
-    plan.num_pairs = map.num_pairs;
 
     if (map.num_pairs > 0) {
         plan.h_direct_write = new uint8_t[map.num_pairs];
@@ -527,36 +469,8 @@ inline ReductionPlan build_reduction_plan(
         return plan;
     }
 
-    // Count temp-buffer pairs per output block.
-    // Volume pairs (tier 0/1) write to d_output, not temp buffer.
-    // On mixed blocks (both volume and CUTLASS), CUTLASS goes to temp buffer
-    // and reduction merges temp → d_output after all tiers complete.
-    std::vector<int64_t> tb_count_by_block(static_cast<size_t>(map.num_output_blocks), 0);
-    for (int64_t p = 0; p < map.num_pairs; ++p) {
-        if (pair_tier[p] != 0) {
-            const int64_t out_block = map.h_pair_output_block_idx[p];
-            tb_count_by_block[static_cast<size_t>(out_block)]++;
-        }
-    }
-
-    // Pass 1: identify direct-write singletons.
-    // Eligible when exactly 1 temp-buffer pair for the output block (any tier != 0)
-    // AND the block is not mixed (no volume pairs writing to d_output concurrently).
-    for (int64_t out_block = 0; out_block < map.num_output_blocks; ++out_block) {
-        if (tb_count_by_block[static_cast<size_t>(out_block)] != 1) continue;
-        if (ob_tier_flags &&
-            (ob_tier_flags[out_block] & (kOBHasLarge | kOBHasMedium)) ==
-            (kOBHasLarge | kOBHasMedium)) continue;
-        const int64_t begin = map.h_output_pair_offsets[out_block];
-        const int64_t end = map.h_output_pair_offsets[out_block + 1];
-        for (int64_t i = begin; i < end; ++i) {
-            const int64_t pair_idx = map.h_output_pair_indices[i];
-            if (pair_tier[pair_idx] != 0) {
-                plan.h_direct_write[pair_idx] = 1;
-                break;
-            }
-        }
-    }
+    std::memcpy(plan.h_direct_write, is_direct.data(),
+                map.num_pairs * sizeof(uint8_t));
 
     // Collect unique reduce source offsets per output block.
     // With streaming temp-buffer reuse, multiple pairs may share the same

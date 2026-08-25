@@ -71,6 +71,8 @@ struct BSDescriptor {
     bool owns_buffer = true;    // false when using external device memory
     int64_t buffer_bytes = 0;   // size of d_buffer allocation
     uint64_t num_blocks = 0;
+    float desc_ms = 0;          // host metadata prep + descriptor create
+                                // (excludes value upload) — for fair setup timing
 
     BSDescriptor() = default;
     ~BSDescriptor() {
@@ -80,7 +82,8 @@ struct BSDescriptor {
     BSDescriptor(BSDescriptor&& o) noexcept
         : desc(o.desc), d_block_ptrs(std::move(o.d_block_ptrs)),
           d_buffer(o.d_buffer), owns_buffer(o.owns_buffer),
-          buffer_bytes(o.buffer_bytes), num_blocks(o.num_blocks)
+          buffer_bytes(o.buffer_bytes), num_blocks(o.num_blocks),
+          desc_ms(o.desc_ms)
     { o.desc = {}; o.d_buffer = nullptr; }
     BSDescriptor& operator=(BSDescriptor&& o) noexcept {
         if (this != &o) {
@@ -91,6 +94,7 @@ struct BSDescriptor {
             d_buffer = o.d_buffer; o.d_buffer = nullptr;
             owns_buffer = o.owns_buffer;
             num_blocks = o.num_blocks;
+            desc_ms = o.desc_ms;
         }
         return *this;
     }
@@ -168,6 +172,11 @@ BSDescriptor<T> create_bs_descriptor(
     const T* d_external_values = nullptr)
 {
     BSDescriptor<T> result;
+    // Timed: host metadata prep + descriptor creation. The value upload
+    // (cudaMalloc+cudaMemcpy, only when d_external_values is null) is
+    // excluded, mirroring the pipeline's setup timing which excludes
+    // input upload and buffer allocation.
+    auto t_desc0 = std::chrono::high_resolution_clock::now();
     const uint32_t numModes = static_cast<uint32_t>(bst.meta.ndim);
     const int ndim = bst.meta.ndim;
     result.num_blocks = static_cast<uint64_t>(bst.block_coords.size());
@@ -214,6 +223,7 @@ BSDescriptor<T> create_bs_descriptor(
         "cutensorCreateBlockSparseTensorDescriptor");
 
     result.buffer_bytes = total_elements * static_cast<int64_t>(sizeof(T));
+    auto t_desc1 = std::chrono::high_resolution_clock::now();
 
     if (d_external_values) {
         // Borrow caller's device buffer — no upload, no ownership.
@@ -231,11 +241,16 @@ BSDescriptor<T> create_bs_descriptor(
     }
 
     // Set up per-block device pointers into the buffer.
+    auto t_desc2 = std::chrono::high_resolution_clock::now();
     result.d_block_ptrs.resize(result.num_blocks);
     for (size_t blk_idx = 0; blk_idx < result.num_blocks; ++blk_idx) {
         T* d_ptr = static_cast<T*>(result.d_buffer) + block_offsets[blk_idx];
         result.d_block_ptrs[blk_idx] = static_cast<const void*>(d_ptr);
     }
+    auto t_desc3 = std::chrono::high_resolution_clock::now();
+    result.desc_ms = static_cast<float>(
+        std::chrono::duration<double, std::milli>(t_desc1 - t_desc0).count() +
+        std::chrono::duration<double, std::milli>(t_desc3 - t_desc2).count());
 
     return result;
 }
@@ -578,6 +593,9 @@ CutensorBlockSparseResult<T> run_cutensor_block_sparse_single(
         : compute_output_block_coords(A_bst, B_bst, expr);
     if (output_coords.empty()) return result;
 
+    // Timed: output descriptor metadata prep + creation (fair-comparison
+    // counterpart of the pipeline's accum-map/plan work, which is timed).
+    auto t_out_desc0 = setup_clock::now();
     auto out_bst = build_output_bst_meta(A_bst, B_bst, expr, output_coords);
     const uint64_t out_nnz = static_cast<uint64_t>(output_coords.size());
 
@@ -600,6 +618,8 @@ CutensorBlockSparseResult<T> run_cutensor_block_sparse_single(
     std::vector<int64_t> out_offsets;
     auto [out_block_volumes, out_total_elements] =
         compute_block_volumes_and_offsets(out_bst, output_coords, out_offsets);
+    double out_desc_ms =
+        std::chrono::duration<double, std::milli>(setup_clock::now() - t_out_desc0).count();
 
     CHandle<void*, cudaFree> d_out_buffer;
     if (out_total_elements > 0) {
@@ -607,6 +627,7 @@ CutensorBlockSparseResult<T> run_cutensor_block_sparse_single(
         cudaMemset(d_out_buffer.h, 0, out_total_elements * sizeof(T));
     }
 
+    auto t_ptrs0 = setup_clock::now();
     std::vector<const void*> d_C_ptrs(out_nnz);
     std::vector<void*> d_D_ptrs(out_nnz);
     int64_t ptr_offset = 0;
@@ -616,6 +637,8 @@ CutensorBlockSparseResult<T> run_cutensor_block_sparse_single(
         d_D_ptrs[i] = static_cast<void*>(ptr);
         ptr_offset += out_block_volumes[i];
     }
+    double out_ptrs_ms =
+        std::chrono::duration<double, std::milli>(setup_clock::now() - t_ptrs0).count();
 
     std::vector<int32_t> mA, mB, mO;
     for (char c : A_bst.meta.indices) mA.push_back(static_cast<int32_t>(c));
@@ -673,8 +696,13 @@ CutensorBlockSparseResult<T> run_cutensor_block_sparse_single(
         "cutensorCreatePlan (block sparse)");
 
     auto t_setup_end = setup_clock::now();
+    // Full host planning cost: A/B descriptor creation + output descriptor
+    // metadata + C/D pointer arrays + contraction descriptor + plan.
+    // Excludes: value/output/workspace allocation, memset, input upload —
+    // matching the pipeline's setup_ms definition (plan+prepare+bind).
     result.setup_ms = static_cast<float>(
-        std::chrono::duration<double, std::milli>(t_setup_end - t_setup_start).count());
+        std::chrono::duration<double, std::milli>(t_setup_end - t_setup_start).count()
+        + a_desc.desc_ms + b_desc.desc_ms + out_desc_ms + out_ptrs_ms);
 
     CHandle<void*, cudaFree> d_workspace;
     if (ws_size > 0) cudaMalloc(&d_workspace.h, ws_size);

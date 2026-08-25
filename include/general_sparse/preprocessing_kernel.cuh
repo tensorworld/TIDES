@@ -35,6 +35,12 @@ struct ContractionConfig {
     // Internal order is: batch dims, then free_A, then free_B
     int32_t internal_to_output[MAX_RANK];
     dim_t output_rank;
+
+    // Set by build_contraction_config when the output rank or a per-category
+    // dim count exceeds MAX_RANK — the fixed arrays above cannot hold the
+    // contraction and callers must reject it loudly (writes are clamped so
+    // the struct itself stays intact, but its contents are unusable).
+    int32_t rank_overflow;
 };
 
 // Host function: compute GEMM dimensions (M, N, K) for a block pair

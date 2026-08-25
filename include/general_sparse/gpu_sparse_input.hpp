@@ -22,13 +22,18 @@ struct GPUSparseInput {
     // Block dimension info (flat)
     std::vector<dim_t> block_dims;        // [num_blocks * rank] dimensions per block
 
-    // Values — either owned (vector) or borrowed (pointer to external data)
+    // Values — owned (vector), borrowed (pointer to external data), or absent
+    // entirely (metadata-only inputs whose device values arrive via
+    // borrow_device_input; total_values then records the element span).
     std::vector<T> values;                // all block data concatenated (owned)
     const T* values_ptr = nullptr;        // non-owning pointer to external data
-    int64_t total_values = 0;             // element count when using values_ptr
+    int64_t total_values = 0;             // element span when values is not owned
 
     const T* get_values_data() const { return values_ptr ? values_ptr : values.data(); }
-    std::size_t get_values_count() const { return values_ptr ? static_cast<std::size_t>(total_values) : values.size(); }
+    std::size_t get_values_count() const {
+        return total_values > 0 ? static_cast<std::size_t>(total_values)
+                                : values.size();
+    }
 
     // Tensor metadata
     dim_t rank;

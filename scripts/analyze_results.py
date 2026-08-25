@@ -6,7 +6,7 @@ Reads raw bench_pipeline_implementations output and computes:
   T1: Iteration speedup per (symmetry, layout)
   T2: Tier count table per symmetry
   T3: Tier FLOP summary per symmetry
-  T4: Setup time comparison (TIDES init vs cuTENSOR setup)
+  T4: Resource-ready prepare time comparison
   T5: Transfer time estimate vs setup overhead
   T6: Streaming workspace savings
 
@@ -18,7 +18,7 @@ Usage:
 
 import argparse
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set
 
 # Import the pipeline parser from parse_results
@@ -147,35 +147,81 @@ def t3_tier_flops(rows: List[PipelineRow]):
 
 
 # ---------------------------------------------------------------------------
-# T4: Setup times — TIDES init vs cuTENSOR setup
+# T4: Resource-ready prepare times
 # ---------------------------------------------------------------------------
 
 def t4_setup_times(rows: List[PipelineRow]):
-    """Per case: TIDES setup (plan+prepare+allocate) vs cuTENSOR setup, with ratio."""
-    print("=" * 80)
-    print("T4: Setup Time Comparison (TIDES plan+prepare+allocate vs cuTENSOR setup)")
-    print("=" * 80)
-    print(f"{'Case':<45} {'TIDES ms':>10} {'cuTENSOR ms':>12} {'Ratio':>8}")
-    print("-" * 80)
+    """Compare host planning separately from device initialization."""
+    print("=" * 128)
+    print("T4: Matched Prepare Time (post-allocation; host planning and device zero shown separately)")
+    print("=" * 128)
+    print(f"{'Case':<45} {'T host':>8} {'CT host':>8} {'Host su':>8} "
+          f"{'T zero':>8} {'CT zero':>8} {'T total':>9} {'CT total':>9}")
+    print("-" * 128)
 
-    for r in sorted(rows, key=lambda x: x.case_name):
-        if r.cutlass_setup_ms == 0 and r.cutensor_setup_ms == 0:
-            continue
-        ratio = r.cutensor_setup_ms / r.cutlass_setup_ms if r.cutlass_setup_ms > 0 else 0
+    valid = [r for r in rows
+             if r.tides_prepare_status == 'ok'
+             and r.cutensor_prepare_status == 'ok']
+    for r in sorted(valid, key=lambda x: x.case_name):
+        ratio = (r.cutensor_host_prepare_ms / r.tides_host_prepare_ms
+                 if r.tides_host_prepare_ms > 0 else 0)
         name = _short_name(r)
-        print(f"{name:<45} {r.cutlass_setup_ms:>10.2f} {r.cutensor_setup_ms:>12.2f} {ratio:>7.1f}x")
+        print(f"{name:<45} {r.tides_host_prepare_ms:>8.3f} "
+              f"{r.cutensor_host_prepare_ms:>8.3f} {ratio:>7.2f}x "
+              f"{r.tides_device_zero_ms:>8.3f} "
+              f"{r.cutensor_device_zero_ms:>8.3f} "
+              f"{r.tides_prepare_ms:>9.3f} "
+              f"{r.cutensor_prepare_ms:>9.3f}")
 
     # Aggregate by layout
     print()
-    agg: Dict[str, dict] = defaultdict(lambda: {'tides': 0.0, 'ct': 0.0, 'n': 0})
-    for r in rows:
-        agg[r.data_layout]['tides'] += r.cutlass_setup_ms
-        agg[r.data_layout]['ct'] += r.cutensor_setup_ms
-        agg[r.data_layout]['n'] += 1
+    agg: Dict[str, dict] = defaultdict(lambda: {
+        't_host': 0.0, 'ct_host': 0.0,
+        't_zero': 0.0, 'ct_zero': 0.0,
+        't_total': 0.0, 'ct_total': 0.0, 'n': 0,
+    })
+    for r in valid:
+        g = agg[r.data_layout]
+        g['t_host'] += r.tides_host_prepare_ms
+        g['ct_host'] += r.cutensor_host_prepare_ms
+        g['t_zero'] += r.tides_device_zero_ms
+        g['ct_zero'] += r.cutensor_device_zero_ms
+        g['t_total'] += r.tides_prepare_ms
+        g['ct_total'] += r.cutensor_prepare_ms
+        g['n'] += 1
     for layout in sorted(agg):
         g = agg[layout]
-        ratio = g['ct'] / g['tides'] if g['tides'] > 0 else 0
-        print(f"  [{layout}] avg TIDES={g['tides']/g['n']:.2f} ms  avg cuTENSOR={g['ct']/g['n']:.2f} ms  ratio={ratio:.1f}x")
+        ratio = g['ct_host'] / g['t_host'] if g['t_host'] > 0 else 0
+        print(f"  [{layout}] n={g['n']} host avg T/CT="
+              f"{g['t_host']/g['n']:.3f}/{g['ct_host']/g['n']:.3f} ms "
+              f"({ratio:.2f}x); zero avg T/CT="
+              f"{g['t_zero']/g['n']:.3f}/{g['ct_zero']/g['n']:.3f} ms; "
+              f"total avg T/CT="
+              f"{g['t_total']/g['n']:.3f}/{g['ct_total']/g['n']:.3f} ms")
+    if valid:
+        t_host = sum(r.tides_host_prepare_ms for r in valid)
+        ct_host = sum(r.cutensor_host_prepare_ms for r in valid)
+        t_zero = sum(r.tides_device_zero_ms for r in valid)
+        ct_zero = sum(r.cutensor_device_zero_ms for r in valid)
+        t_total = sum(r.tides_prepare_ms for r in valid)
+        ct_total = sum(r.cutensor_prepare_ms for r in valid)
+        tides_wins = sum(r.tides_host_prepare_ms < r.cutensor_host_prepare_ms
+                         for r in valid)
+        ratio = ct_host / t_host if t_host > 0 else 0
+        print(f"  [overall] n={len(valid)} host T/CT={t_host:.3f}/{ct_host:.3f} ms "
+              f"({ratio:.2f}x, TIDES wins {tides_wins}/{len(valid)}); "
+              f"zero T/CT={t_zero:.3f}/{ct_zero:.3f} ms; "
+              f"total T/CT={t_total:.3f}/{ct_total:.3f} ms")
+
+    excluded = len(rows) - len(valid)
+    if excluded:
+        status_pairs = Counter(
+            (r.tides_prepare_status, r.cutensor_prepare_status)
+            for r in rows if r not in valid)
+        details = ', '.join(
+            f"T={t}/CT={ct}: {n}"
+            for (t, ct), n in sorted(status_pairs.items()))
+        print(f"  [excluded] {excluded}/{len(rows)} cases ({details})")
     print()
 
 

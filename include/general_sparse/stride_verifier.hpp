@@ -16,8 +16,9 @@
 #endif
 
 // Stride-based verification for the GPU pipeline.
-// Compares pipeline output (internal order, row-major) against cuTENSOR reference
-// (output order, column-major) using stride arithmetic instead of data transposition.
+// Compares pipeline output (einsum output order, row-major) against cuTENSOR
+// reference (output order, column-major) using stride arithmetic instead of
+// data transposition.
 namespace bsptc {
 
 struct StrideVerificationResult {
@@ -88,7 +89,7 @@ inline std::vector<std::vector<int64_t>> compute_internal_section_offsets(
 
 // Verify pipeline output directly against cuTENSOR block-sparse output.
 // Compares block-by-block: checks for missing/extra blocks and element-level diffs.
-// Pipeline blocks are internal order (row-major), cuTENSOR blocks are output order (col-major).
+// Pipeline blocks are output order (row-major), cuTENSOR blocks are output order (col-major).
 template <typename T>
 StrideVerificationResult verify_against_block_sparse(
     const GeneralSparseResult<T>& pipeline_result,
@@ -140,14 +141,19 @@ StrideVerificationResult verify_against_block_sparse(
     bool global_passed = true;
 
     for (int64_t blk = 0; blk < pipeline_result.num_output_blocks; ++blk) {
-        const int32_t* block_coord_internal = &pipeline_result.output_block_coords[blk * rank];
+        const int32_t* block_coord_out = &pipeline_result.output_block_coords[blk * rank];
         const int64_t src_offset = pipeline_result.output_offsets[blk];
         const int64_t volume = pipeline_result.output_volumes[blk];
 
-        // Convert internal-order coord to output-order coord
+        // Pipeline coords are already in output label order
         std::vector<int64_t> out_coord(rank);
         for (int32_t d = 0; d < rank; ++d)
-            out_coord[config.internal_to_output[d]] = block_coord_internal[d];
+            out_coord[d] = block_coord_out[d];
+
+        // Recover internal-order coord for section-size lookups
+        int32_t coord_internal[MAX_RANK];
+        for (int32_t d = 0; d < rank; ++d)
+            coord_internal[d] = block_coord_out[config.internal_to_output[d]];
 
         // Look up in cuTENSOR map
         auto it = ref_coord_map.find(out_coord);
@@ -175,34 +181,30 @@ StrideVerificationResult verify_against_block_sparse(
         size_t ref_idx = it->second;
         ref_matched[ref_idx] = true;
 
-        // Get block dims in internal order
+        // Get block dims in internal order, then map to output order
         dim_t block_dims[MAX_RANK];
         int32_t pos = 0;
         for (int32_t i = 0; i < config.num_batch; ++i, ++pos)
-            block_dims[pos] = get_block_size(A_gpu, config.batch_pos_A[i], block_coord_internal[pos]);
+            block_dims[pos] = get_block_size(A_gpu, config.batch_pos_A[i], coord_internal[pos]);
         for (int32_t i = 0; i < config.num_free_A; ++i, ++pos)
-            block_dims[pos] = get_block_size(A_gpu, config.free_pos_A[i], block_coord_internal[pos]);
+            block_dims[pos] = get_block_size(A_gpu, config.free_pos_A[i], coord_internal[pos]);
         for (int32_t i = 0; i < config.num_free_B; ++i, ++pos)
-            block_dims[pos] = get_block_size(B_gpu, config.free_pos_B[i], block_coord_internal[pos]);
+            block_dims[pos] = get_block_size(B_gpu, config.free_pos_B[i], coord_internal[pos]);
 
-        // Compute output-order block shape and col-major strides for the ref block
         dim_t out_block_dims[MAX_RANK];
         for (int32_t d = 0; d < rank; ++d)
             out_block_dims[config.internal_to_output[d]] = block_dims[d];
 
+        // cuTENSOR ref block is col-major in output order; the pipeline block
+        // is row-major in output order — same dim order, opposite majorness.
         int64_t ref_cm_strides[MAX_RANK];
         ref_cm_strides[0] = 1;
         for (int32_t d = 1; d < rank; ++d)
             ref_cm_strides[d] = ref_cm_strides[d - 1] * out_block_dims[d - 1];
 
-        // Precompute: ref_cm_stride remapped to internal order
-        int64_t ref_cm_stride_internal[MAX_RANK];
-        for (int32_t d = 0; d < rank; ++d)
-            ref_cm_stride_internal[d] = ref_cm_strides[config.internal_to_output[d]];
-
         const T* ref_block = ref.block_data.data() + ref.block_offsets[ref_idx];
 
-        // Iterate over elements in row-major (internal order)
+        // Iterate over elements in row-major (output order)
         int64_t local_coord[MAX_RANK] = {};
         double blk_max_abs = 0.0;
         double blk_max_rel = 0.0;
@@ -212,7 +214,7 @@ StrideVerificationResult verify_against_block_sparse(
             // Compute col-major index in ref block
             int64_t ref_off = 0;
             for (int32_t d = 0; d < rank; ++d)
-                ref_off += local_coord[d] * ref_cm_stride_internal[d];
+                ref_off += local_coord[d] * ref_cm_strides[d];
 
             double a = static_cast<double>(ref_block[ref_off]);
             double b = static_cast<double>(host_data[src_offset + elem]);
@@ -226,7 +228,7 @@ StrideVerificationResult verify_against_block_sparse(
 
             // Increment local coordinates (row-major: last dimension fastest)
             for (int32_t d = rank - 1; d >= 0; --d) {
-                if (++local_coord[d] < block_dims[d]) break;
+                if (++local_coord[d] < out_block_dims[d]) break;
                 local_coord[d] = 0;
             }
         }

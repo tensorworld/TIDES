@@ -35,7 +35,6 @@ static int g_max_section_size = 64;
 static double g_density = 0.3;
 static bool g_f64 = false;
 static bool g_stop_on_fail = false;
-static int64_t g_mn_threshold = DEFAULT_CUTLASS_MN_THRESHOLD;
 static bool g_verbose = false;
 static int64_t g_mem_limit_bytes = 2048LL * 1024 * 1024; // 2 GB
 static int64_t g_streaming_cap_mb = 0; // 0 = disabled; >0 = streaming transpose buffer cap in MB
@@ -125,8 +124,6 @@ static void parse_args(int argc, char **argv) {
       g_f64 = (dt == "f64" || dt == "float64");
     } else if (arg == "--stop-on-fail") {
       g_stop_on_fail = true;
-    } else if (arg == "--threshold") {
-      g_mn_threshold = std::stoll(next());
     } else if (arg == "--verbose") {
       g_verbose = true;
     } else if (arg == "--mem-limit") {
@@ -177,7 +174,6 @@ static void parse_args(int argc, char **argv) {
           "scale)\n"
           "  --density F            Block density [0,1] (default: 0.3 fuzz, "
           "0.5 scale)\n"
-          "  --threshold N          M*N threshold for CUTLASS (default: 4096)\n"
           "  --max-section-size N   Max block section size (default: 64)\n"
           "  --min-section-size N   Min block section size (default: 1)\n"
           "  --section-size N       Fix all block sections to this size\n"
@@ -322,7 +318,6 @@ static int run_one_fuzz(int iter, uint64_t seed, bool verbose) {
   PipelineTimingBreakdown timing{};
   try {
     DispatchConfig dc;
-    dc.mn_threshold = g_mn_threshold;
     dc.transpose_buf_cap = (g_streaming_cap_mb * 1024LL * 1024) / static_cast<int64_t>(sizeof(T));
     dc.vol_max_tiles = g_vol_max_tiles;
     auto A_dev = copy_sparse_to_device(A_gpu);
@@ -418,9 +413,8 @@ template <typename T> static void run_fuzz_mode() {
               "max_sections=%d, max_section_size=%d, density=%.2f\n",
               base_seed, g_count, g_max_rank, g_max_sections,
               g_max_section_size, g_density);
-  std::printf("Memory limit: %.0f MB, threshold: %ld",
-              static_cast<double>(g_mem_limit_bytes) / (1024.0 * 1024.0),
-              static_cast<long>(g_mn_threshold));
+  std::printf("Memory limit: %.0f MB",
+              static_cast<double>(g_mem_limit_bytes) / (1024.0 * 1024.0));
   if (g_streaming_cap_mb > 0)
     std::printf(", streaming: %ld MB", static_cast<long>(g_streaming_cap_mb));
   std::printf("\n\n");
@@ -815,7 +809,6 @@ static void run_single_sweep(const std::string &sweep_name,
       }
 
       DispatchConfig dc;
-      dc.mn_threshold = g_mn_threshold;
       dc.transpose_buf_cap = (g_streaming_cap_mb * 1024LL * 1024) / static_cast<int64_t>(sizeof(T));
       dc.vol_max_tiles = g_vol_max_tiles;
       auto A_dev = copy_sparse_to_device(A_gpu);
@@ -869,6 +862,10 @@ static void run_single_sweep(const std::string &sweep_name,
           ++verified_skip;
         }
       }
+
+      // Release the verification result before the timing loops; at the
+      // largest sweep points it holds a device buffer of ~10 GB.
+      first_result = GeneralSparseResult<T>{};
 
       // Pre-compute output block structure (excluded from timing).
       // Simulates iterative pipeline where C's sparsity pattern is known.
@@ -942,7 +939,7 @@ static void run_single_sweep(const std::string &sweep_name,
       if (g_verbose) {
         std::printf("           einsum=%s  plan=%.3f prepare=%.3f bind=%.3f(up=%.3f patch=%.3f strm=%.3f) alloc=%.3f | "
                     "preproc=%.3f accum_map=%.3f transpose=%.3f "
-                    "contract=%.3f accumulate=%.3f ms"
+                    "contract=%.3f accumulate=%.3f out_permute=%.3f ms"
                     "  med_shapes=%d"
                     "  ct_plan=%.3f ct_kern=%.3f\n",
                     rc.einsum_str.c_str(),
@@ -951,7 +948,8 @@ static void run_single_sweep(const std::string &sweep_name,
                     last_tb.allocate_ms,
                     last_tb.preprocess_ms, last_tb.accum_map_ms,
                     last_tb.transpose_ms, last_tb.contraction_ms,
-                    last_tb.accumulation_ms, last_tb.medium_shapes,
+                    last_tb.accumulation_ms, last_tb.output_permute_ms,
+                    last_tb.medium_shapes,
                     ct_setup_ms, ct_exec_ms);
       }
 

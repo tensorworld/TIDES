@@ -185,7 +185,7 @@ static int64_t product(const std::vector<int64_t>& dims) {
 }
 
 // Generate per-block volumes for uniform or skewed distribution.
-// Skewed: 20% get 4x, 30% get 1x, 50% get 1/4x (min mn_threshold).
+// Skewed: 20% get 4x, 30% get 1x, 50% get 1/4x (clamped to min_vol).
 static std::vector<int64_t> generate_volumes(int num_blocks, int64_t nominal, bool skewed,
                                               int64_t min_vol = 4096) {
     std::vector<int64_t> vols(num_blocks);
@@ -460,15 +460,14 @@ static void run_accum_bench(int warmup, int repeat, cudaStream_t stream) {
                         {
                             // reduce_noatomic
                             ReductionPlan plan;
-                            plan.num_pairs = total_pairs;
                             plan.num_reduce_groups = num_out;
 
-                            plan.h_reduce_dest_offsets = (int64_t*)malloc(num_out * sizeof(int64_t));
-                            plan.h_reduce_volumes = (int64_t*)malloc(num_out * sizeof(int64_t));
-                            plan.h_reduce_src_ptrs = (int64_t*)malloc((num_out + 1) * sizeof(int64_t));
+                            plan.h_reduce_dest_offsets = new int64_t[num_out];
+                            plan.h_reduce_volumes = new int64_t[num_out];
+                            plan.h_reduce_src_ptrs = new int64_t[num_out + 1];
 
                             // Count total src entries = total_pairs
-                            plan.h_reduce_src_offsets = (int64_t*)malloc(total_pairs * sizeof(int64_t));
+                            plan.h_reduce_src_offsets = new int64_t[total_pairs];
 
                             int64_t p = 0;
                             for (int b = 0; b < num_out; b++) {
@@ -491,15 +490,7 @@ static void run_accum_bench(int warmup, int repeat, cudaStream_t stream) {
                                     d_temp, d_out, plan, stream);
                             }, warmup, repeat, stream);
 
-                            // Free plan
-                            free(plan.h_reduce_dest_offsets);
-                            free(plan.h_reduce_volumes);
-                            free(plan.h_reduce_src_ptrs);
-                            free(plan.h_reduce_src_offsets);
-                            cudaFree(plan.d_reduce_dest_offsets);
-                            cudaFree(plan.d_reduce_volumes);
-                            cudaFree(plan.d_reduce_src_offsets);
-                            cudaFree(plan.d_reduce_src_ptrs);
+                            // plan frees its own host + device arrays on scope exit
                         }
 
                         // Throughput: read temp + write output

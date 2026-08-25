@@ -92,8 +92,7 @@ bool run_pipeline_test(
     const std::string& tensor_A_content,
     const std::string& tensor_B_content,
     double atol = 1e-5,
-    double rtol = 1e-5,
-    int64_t mn_threshold = DEFAULT_CUTLASS_MN_THRESHOLD)
+    double rtol = 1e-5)
 {
     std::cout << "Test: " << name << " ... " << std::flush;
 
@@ -146,7 +145,6 @@ bool run_pipeline_test(
 
         // Run pipeline
         DispatchConfig dc;
-        dc.mn_threshold = mn_threshold;
         auto A_dev = copy_sparse_to_device(A_gpu);
         auto B_dev = copy_sparse_to_device(B_gpu);
         auto pipeline_result = execute_general_sparse_pipeline(
@@ -156,7 +154,17 @@ bool run_pipeline_test(
         std::remove(fileB.c_str());
 
         if (pipeline_result.total_output_elements == 0) {
-            std::cout << "PASSED (empty result)\n";
+            // A genuinely-empty contraction must agree with the reference.
+            // An unconditional pass here hid vacuously-passing tests for
+            // months (batch-leftmost rejections yielded empty results).
+            auto bs_empty_ref = run_cutensor_block_sparse<T>(A, B, expr);
+            if (bs_empty_ref.total_block_elements != 0) {
+                std::cout << "FAILED (pipeline empty but reference has "
+                          << bs_empty_ref.total_block_elements << " elements)\n";
+                g_failed++;
+                return false;
+            }
+            std::cout << "PASSED (empty result, reference empty)\n";
             g_passed++;
             return true;
         }
@@ -189,6 +197,77 @@ bool run_pipeline_test(
     }
 }
 
+// Test that the pipeline REJECTS an unsupported contraction (pipeline_setup
+// fails, execute_general_sparse_pipeline throws). Used for the batch-leftmost
+// invariant: batch dims must be leading in both operands.
+template <typename T>
+bool run_rejection_test(
+    const std::string& name,
+    const std::string& einsum_str,
+    const std::string& tensor_A_content,
+    const std::string& tensor_B_content)
+{
+    std::cout << "Test: " << name << " ... " << std::flush;
+
+    try {
+        std::string fileA = create_temp_tensor(tensor_A_content);
+        std::string fileB = create_temp_tensor(tensor_B_content);
+
+        DataType dtype = std::is_same<T, double>::value ? DataType::FLOAT64 : DataType::FLOAT32;
+        auto tensors = parse_tensor_files({fileA, fileB}, dtype);
+
+        auto expr = parse_einsum(einsum_str);
+        std::vector<std::vector<int64_t>> shapes = {
+            block_utils::compute_full_shape(tensors[0]),
+            block_utils::compute_full_shape(tensors[1])
+        };
+        validate_einsum(expr, shapes);
+
+        EinsumIndexSets index_sets;
+        create_einsum_index_sets(expr, index_sets);
+
+        auto A_gpu = to_gpu_input<T>(tensors[0]);
+        auto B_gpu = to_gpu_input<T>(tensors[1]);
+        auto A_dev = copy_sparse_to_device(A_gpu);
+        auto B_dev = copy_sparse_to_device(B_gpu);
+
+        std::remove(fileA.c_str());
+        std::remove(fileB.c_str());
+
+        // Assert the setup phase itself rejects the contraction — stronger
+        // than only catching the wrapper's exception, which any unrelated
+        // runtime_error (e.g. a CUDA failure) would also satisfy.
+        {
+            PipelinePlan<T> plan;
+            if (pipeline_setup<T>(plan, A_gpu, B_gpu, A_dev, B_dev,
+                                  index_sets, expr.output_labels)) {
+                std::cout << "FAILED (expected pipeline_setup to reject)\n";
+                g_failed++;
+                return false;
+            }
+        }
+
+        // The one-call wrapper must surface that rejection as an exception,
+        // not an empty result.
+        try {
+            auto result = execute_general_sparse_pipeline(
+                A_gpu, B_gpu, A_dev, B_dev, index_sets, expr.output_labels);
+            std::cout << "FAILED (expected rejection, but pipeline produced "
+                      << result.total_output_elements << " elements)\n";
+            g_failed++;
+            return false;
+        } catch (const std::runtime_error&) {
+            std::cout << "PASSED (rejected in pipeline_setup, wrapper threw)\n";
+            g_passed++;
+            return true;
+        }
+    } catch (const std::exception& e) {
+        std::cout << "FAILED (exception: " << e.what() << ")\n";
+        g_failed++;
+        return false;
+    }
+}
+
 // Test that PipelineTimingBreakdown fields are correct for known contractions.
 template <typename T>
 bool run_timing_stats_test(
@@ -199,8 +278,7 @@ bool run_timing_stats_test(
     // Expected tier occupancy (true = tier should have work)
     bool expect_large, bool expect_medium, bool expect_small,
     // Whether transpose should actually run (not just be "needed")
-    bool expect_transpose_runs,
-    int64_t mn_threshold = DEFAULT_CUTLASS_MN_THRESHOLD)
+    bool expect_transpose_runs)
 {
     std::cout << "Test: " << name << " ... " << std::flush;
 
@@ -227,7 +305,6 @@ bool run_timing_stats_test(
         auto B_gpu = to_gpu_input<T>(B);
 
         DispatchConfig dc;
-        dc.mn_threshold = mn_threshold;
 
         // Run with timing, then reuse to check stale-field bug
         PipelineTimingBreakdown tb;
@@ -328,8 +405,7 @@ bool run_fuzz_seed_test(
     int max_section_size = 64,
     double density = 0.3,
     double atol = 1e-5,
-    double rtol = 1e-5,
-    int64_t mn_threshold = DEFAULT_CUTLASS_MN_THRESHOLD)
+    double rtol = 1e-5)
 {
     std::cout << "Test: " << name << " ... " << std::flush;
 
@@ -370,14 +446,21 @@ bool run_fuzz_seed_test(
 
         // Run pipeline
         DispatchConfig dc;
-        dc.mn_threshold = mn_threshold;
         auto A_dev = copy_sparse_to_device(A_gpu);
         auto B_dev = copy_sparse_to_device(B_gpu);
         auto pipeline_result = execute_general_sparse_pipeline(
             A_gpu, B_gpu, A_dev, B_dev, index_sets, expr.output_labels, dc);
 
         if (pipeline_result.total_output_elements == 0) {
-            std::cout << "PASSED (empty result)\n";
+            // Empty must agree with the reference (see run_pipeline_test).
+            auto bs_empty_ref = run_cutensor_block_sparse<T>(rc.A, rc.B, expr);
+            if (bs_empty_ref.total_block_elements != 0) {
+                std::cout << "FAILED (pipeline empty but reference has "
+                          << bs_empty_ref.total_block_elements << " elements)\n";
+                g_failed++;
+                return false;
+            }
+            std::cout << "PASSED (empty result, reference empty)\n";
             g_passed++;
             return true;
         }
@@ -462,8 +545,8 @@ static void run_f64_subset() {
     run_pipeline_test<double>("Small accumulation", "ij,jk->ik", SMALL_ACCUM_A, SMALL_ACCUM_B, D_ATOL, D_RTOL);
 
     std::cout << "\n--- FP64 Small Interleaved Tests ---\n";
-    run_pipeline_test<double>("Small interleaved batch ibj,bjk->bik", "ibj,bjk->bik",
-        SMALL_INTERLEAVED_BATCH_A, SMALL_INTERLEAVED_BATCH_B, D_ATOL, D_RTOL);
+    run_rejection_test<double>("Small interleaved batch rejected ibj,bjk->bik", "ibj,bjk->bik",
+        SMALL_INTERLEAVED_BATCH_A, SMALL_INTERLEAVED_BATCH_B);
 
     std::cout << "\n--- FP64 Mixed Dispatch Tests ---\n";
     // Note: MIXED_DISPATCH test skipped in fp64 — known CUTLASS grouped GEMM
@@ -510,7 +593,10 @@ int main(int argc, char** argv) {
 
     std::cout << "\n--- Tensor Rank Tests ---\n";
     run_pipeline_test<float>("3D double contraction ijk,jkl->il", "ijk,jkl->il", T3D_A, T3D_B);
-    run_pipeline_test<float>("3D single contraction ijk,jkl->ikl", "ijk,jkl->ikl", T3D_A, T3D_B);
+    // ijk,jkl->ikl has batch label k at a non-leading position in A — the
+    // pipeline rejects it (batch-leftmost invariant). Previously this "passed"
+    // vacuously via a silently empty result.
+    run_rejection_test<float>("3D batch-not-leading rejected (ijk,jkl->ikl)", "ijk,jkl->ikl", T3D_A, T3D_B);
     run_pipeline_test<float>("4D GEMM-like abcd,efcd->abef", "abcd,efcd->abef", T4D_A, T4D_B);
 
     std::cout << "\n--- Special Cases ---\n";
@@ -555,9 +641,34 @@ int main(int argc, char** argv) {
     run_pipeline_test<float>(
         "A interleaved [C,F,C] (jik,jkl->il)", "jik,jkl->il",
         INTERLEAVED_A_A, INTERLEAVED_A_B);
-    run_pipeline_test<float>(
-        "Batch not leading [F,B,C] (ibj,bjk->bik)", "ibj,bjk->bik",
+    run_rejection_test<float>(
+        "Batch not leading rejected [F,B,C] (ibj,bjk->bik)", "ibj,bjk->bik",
         BATCH_NONLEAD_A, BATCH_NONLEAD_B);
+    run_rejection_test<float>(
+        "Batch not leading in B rejected (bij,jbk->bik)", "bij,jbk->bik",
+        BATCH_NONLEAD_B_SIDE_A, BATCH_NONLEAD_B_SIDE_B);
+    run_rejection_test<float>(
+        "Reversed batch prefix rejected (abij,bajk->abik)", "abij,bajk->abik",
+        BATCH_PREFIX_REVERSED_A, BATCH_PREFIX_REVERSED_B);
+    // Squashed-rank overflow: warp/volume desc formats can't hold these
+    // shapes (reversed-K dual squash keeps 5 groups); the partitioner must
+    // reroute them to CUTLASS (correct numerics prove neither tier's
+    // fixed-capacity desc arrays were overflowed).
+    run_pipeline_test<float>(
+        "Warp rank overflow reroutes to CUTLASS (muvwxy,yxwvun->mn)",
+        "muvwxy,yxwvun->mn", RANK_OVERFLOW_KREV_A_WARP, RANK_OVERFLOW_KREV_B_WARP);
+    run_pipeline_test<float>(
+        "Volume rank overflow reroutes to CUTLASS (muvwxy,yxwvun->mn, m=n=4)",
+        "muvwxy,yxwvun->mn", RANK_OVERFLOW_KREV_A_VOL, RANK_OVERFLOW_KREV_B_VOL);
+    // Fully-alternating shapes overflow every tier INCLUDING the hypertile
+    // transpose (10 non-mergeable groups > HT_MAX_RANK) — no execution path
+    // exists, so setup must fail loudly instead of corrupting stack arrays.
+    run_rejection_test<float>(
+        "Unrepresentable transpose rejected (aubvcwdxey,uvwxyz->abcdez)",
+        "aubvcwdxey,uvwxyz->abcdez", RANK_OVERFLOW_A, RANK_OVERFLOW_B_WARP);
+    run_rejection_test<float>(
+        "Unrepresentable transpose rejected (aubvcwdxey,uvwxyzt->abcdezt)",
+        "aubvcwdxey,uvwxyzt->abcdezt", RANK_OVERFLOW_A, RANK_OVERFLOW_B_VOL);
     run_pipeline_test<float>(
         "B interleaved [C,F,C] (ijk,jlk->il)", "ijk,jlk->il",
         INTERLEAVED_B_A, INTERLEAVED_B_TENSOR);
@@ -565,12 +676,34 @@ int main(int argc, char** argv) {
         "Both interleaved [C,F,C] (jik,jlk->il)", "jik,jlk->il",
         INTERLEAVED_A_A, INTERLEAVED_B_TENSOR);
 
+    // Post-contraction output permute: einsum output order differs from
+    // internal order [batch, free_A, free_B]; the result buffer must be
+    // physically rearranged (hypertile permute stage), not just re-labeled.
+    std::cout << "\n--- Output Permute Tests (einsum output order) ---\n";
+    run_pipeline_test<float>(
+        "Batch moved inward (bij,bjk->ibk)", "bij,bjk->ibk", BATCH_A, BATCH_B);
+    run_pipeline_test<float>(
+        "Free dims interleaved (abcd,efcd->aebf)", "abcd,efcd->aebf",
+        T4D_A, T4D_B);
+    run_pipeline_test<float>(
+        "Large-tier permuted output (ij,kj->ki)", "ij,kj->ki",
+        LARGE_NT_MAT_A, LARGE_NT_MAT_B);
+    run_pipeline_test<float>(
+        "All-trivial permute, size-1 dim moved (ij,jk->ki)", "ij,jk->ki",
+        TRIV_PERM_A, TRIV_PERM_B);
+    // Output rank 10 > MAX_RANK=8: ContractionConfig's internal_to_output
+    // (and all downstream output-coord arrays) cannot hold it — must be
+    // rejected in pipeline_plan, not silently corrupt memory.
+    run_rejection_test<float>(
+        "Output rank exceeds MAX_RANK rejected (acegik,bdfhjk->abcdefghij)",
+        "acegik,bdfhjk->abcdefghij", OUT_PERM_OVERFLOW_A, OUT_PERM_OVERFLOW_B);
+
     std::cout << "\n--- Large-Block Must-Transpose Tests ---\n";
     run_pipeline_test<float>(
         "Large A interleaved (jik,jkl->il)", "jik,jkl->il",
         LARGE_INTERLEAVED_A_A, LARGE_INTERLEAVED_A_B);
-    run_pipeline_test<float>(
-        "Large batch not leading (ibj,bjk->bik)", "ibj,bjk->bik",
+    run_rejection_test<float>(
+        "Large batch not leading rejected (ibj,bjk->bik)", "ibj,bjk->bik",
         LARGE_BATCH_NONLEAD_A, LARGE_BATCH_NONLEAD_B);
     run_pipeline_test<float>(
         "Large B interleaved (ijk,jlk->il)", "ijk,jlk->il",
@@ -635,7 +768,7 @@ int main(int argc, char** argv) {
     // Small interleaved tests: small-only blocks with interleaved layouts
     // (no large/medium blocks to trigger physical transpose)
     std::cout << "\n--- Small Interleaved Tests (no-transpose path) ---\n";
-    run_pipeline_test<float>("Small interleaved batch ibj,bjk->bik", "ibj,bjk->bik",
+    run_rejection_test<float>("Small interleaved batch rejected ibj,bjk->bik", "ibj,bjk->bik",
         SMALL_INTERLEAVED_BATCH_A, SMALL_INTERLEAVED_BATCH_B);
     run_pipeline_test<float>("Small interleaved coalesce jkil,jklm->im", "jkil,jklm->im",
         SMALL_INTERLEAVED_COALESCE_A, SMALL_INTERLEAVED_COALESCE_B);
@@ -720,26 +853,22 @@ int main(int argc, char** argv) {
         pairs[1].output_offset = 4;
         pairs[1].output_volume = 4;
 
+        // AccumulationMap owns its arrays (freed by its destructor)
         AccumulationMap accum{};
         accum.num_pairs = 2;
         accum.output_rank = 1;
         accum.num_output_blocks = 1;
         accum.total_output_elements = 4;
-        int64_t dest_offs[] = {0, 0};  // both write to same output location
-        accum.h_dest_offsets = dest_offs;
-        int64_t ob_idx[] = {0, 0};
-        accum.h_pair_output_block_idx = ob_idx;
-        int64_t ob_offset = 0;
-        accum.h_output_block_offsets = &ob_offset;
-        int64_t ob_volume = 4;
-        accum.h_output_block_volumes = &ob_volume;
-        int64_t op_offsets[] = {0, 2};  // 1 output block, 2 pairs
-        accum.h_output_pair_offsets = op_offsets;
-        int64_t op_indices[] = {0, 1};
-        accum.h_output_pair_indices = op_indices;
+        accum.h_dest_offsets = new int64_t[2]{0, 0};  // both write to same output location
+        accum.h_pair_output_block_idx = new int64_t[2]{0, 0};
+        accum.h_output_block_offsets = new int64_t[1]{0};
+        accum.h_output_block_volumes = new int64_t[1]{4};
+        accum.h_output_pair_offsets = new int64_t[2]{0, 2};  // 1 output block, 2 pairs
+        accum.h_output_pair_indices = new int64_t[2]{0, 1};
 
         std::vector<uint8_t> pair_tier = {1, 1}; // both medium tier
-        auto rplan = build_reduction_plan(accum, pair_tier, pairs);
+        auto is_direct = compute_direct_write_eligibility(accum, pair_tier);
+        auto rplan = build_reduction_plan(accum, pair_tier, is_direct, pairs);
         upload_reduction_plan(rplan);
         cudaDeviceSynchronize();
 
@@ -756,13 +885,7 @@ int main(int argc, char** argv) {
         float h_out[4];
         cudaMemcpy(h_out, d_out, 4 * sizeof(float), cudaMemcpyDeviceToHost);
         cudaFree(d_temp); cudaFree(d_out);
-        // Don't call free_reduction_plan — it would double-free the stack pointers
-        // Just free GPU resources
-        if (rplan.d_reduce_dest_offsets) cudaFree(rplan.d_reduce_dest_offsets);
-        if (rplan.d_reduce_volumes) cudaFree(rplan.d_reduce_volumes);
-        if (rplan.d_reduce_src_offsets) cudaFree(rplan.d_reduce_src_offsets);
-        if (rplan.d_reduce_src_ptrs) cudaFree(rplan.d_reduce_src_ptrs);
-        delete[] rplan.h_direct_write;
+        // rplan frees its own host + device arrays on scope exit
 
         // Expected: element-wise sum [11, 22, 33, 44]
         bool ok = (h_out[0] == 11.0f && h_out[1] == 22.0f &&
@@ -822,11 +945,12 @@ int main(int argc, char** argv) {
     // --- Streaming transpose tests ---
     // Re-run select fuzz seeds with small transpose_buf_cap to force multi-batch streaming.
     // Streaming only activates when: large work exists AND no small/medium needs transpose.
-    // We use a very low mn_threshold (1) to route everything to large tier.
+    // These seeds naturally produce large-tier-dominant work (the former
+    // mn_threshold knob claimed to force this but was never wired up).
     std::cout << "\n--- Streaming Transpose Tests ---\n";
 
     auto run_streaming_test = [&](const std::string& name, uint64_t seed,
-                                  int64_t buf_cap, int64_t mn_threshold_val = 1) {
+                                  int64_t buf_cap) {
         std::cout << "Test: " << name << " ... " << std::flush;
         try {
             std::mt19937 meta_rng(seed);
@@ -849,13 +973,11 @@ int main(int argc, char** argv) {
 
             // Reference: no streaming
             DispatchConfig dc_ref;
-            dc_ref.mn_threshold = mn_threshold_val;
             auto ref = execute_general_sparse_pipeline<float>(
                 A_gpu, B_gpu, A_dev, B_dev, index_sets, expr.output_labels, dc_ref);
 
             // Streaming
             DispatchConfig dc_stream;
-            dc_stream.mn_threshold = mn_threshold_val;
             dc_stream.transpose_buf_cap = buf_cap;
             auto streamed = execute_general_sparse_pipeline<float>(
                 A_gpu, B_gpu, A_dev, B_dev, index_sets, expr.output_labels, dc_stream);
@@ -898,7 +1020,7 @@ int main(int argc, char** argv) {
     };
 
     // Test seeds that produce large-only work with transpose
-    run_streaming_test("Streaming: seed 42, buf_cap=1024", 42, 1024, 1);
+    run_streaming_test("Streaming: seed 42, buf_cap=1024", 42, 1024);
     run_streaming_test("Streaming: seed 42, buf_cap=4096", 42, 4096);
     run_streaming_test("Streaming: seed 77, buf_cap=2048", 77, 2048);
     run_streaming_test("Streaming: seed 999, buf_cap=512", 999, 512);

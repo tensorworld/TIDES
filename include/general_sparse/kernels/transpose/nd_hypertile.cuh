@@ -215,6 +215,12 @@ inline SquashResult squash_dims(
 
     SquashResult r{};
     r.rank = sq.rank;
+    if (!sq.fits()) {
+        // More than HT_MAX_RANK non-mergeable dims: unrepresentable. Arrays
+        // stay unwritten; build_task_for_shape flags rank_overflow (NOT skip,
+        // which would silently leave the data untransposed).
+        return r;
+    }
     for (int i = 0; i < sq.rank; ++i) {
         r.shape[i] = static_cast<int32_t>(sq.shapes[i]);
         r.src_stride[i] = sq.strides_a[i];
@@ -777,6 +783,10 @@ struct SingleTaskResult {
     HypertileShapeMax shape;
     HypertileTaskInfo info;
     bool skip;
+    // Squashed rank exceeds HT_MAX_RANK: the shape NEEDS a transpose but the
+    // hypertile kernel cannot represent it. Callers must fail loudly — this
+    // is distinct from skip (= no data movement needed).
+    bool rank_overflow = false;
 };
 
 inline SingleTaskResult build_task_for_shape(
@@ -805,6 +815,10 @@ inline SingleTaskResult build_task_for_shape(
         dst_stride_for_src[sd] = dst_strides_pos[full_perm[sd]];
 
     SquashResult sq = squash_dims(dims, src_stride, dst_stride_for_src, rank);
+    if (sq.rank > HT_MAX_RANK) {
+        result.rank_overflow = true;
+        return result;
+    }
     if (sq.rank < 2 || sq.is_identity) return result;
 
     int32_t tile_shape[HT_MAX_RANK];
@@ -1398,6 +1412,10 @@ struct HypertileIndex {
     int32_t min_rr = HT_MAX_RANK, min_wr = HT_MAX_RANK;
 
     bool valid = false;
+    // Some shape needs a transpose the kernel cannot represent (squashed rank
+    // > HT_MAX_RANK). pipeline_prepare fails loudly on this — proceeding
+    // would silently skip the transpose and corrupt results.
+    bool rank_overflow = false;
 
     // No GPU resources owned (shapes live in TransposePrecompBuffers)
     ~HypertileIndex() = default;

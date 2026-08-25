@@ -59,18 +59,29 @@ std::vector<BlockPairInfo> find_matching_pairs_impl(
         a_map[key].push_back(ai);
     }
 
-    // Probe phase: look up each B block's key, emit pairs
-    std::vector<BlockPairInfo> pairs;
+    // Probe phase: look up each B block's key once, caching the matched A
+    // list; sum match counts so the pairs vector is allocated exactly once
+    // (push_back reallocation copies the whole vector at scale).
+    std::vector<const std::vector<int32_t>*> b_matches(
+        static_cast<size_t>(B_gpu.num_blocks), nullptr);
+    size_t total_pairs = 0;
     for (int32_t bi = 0; bi < B_gpu.num_blocks; ++bi) {
         auto key = extract_match_key_fixed<N>(
             B_gpu.block_coords.data(), B_gpu.rank, bi,
             config.contracted_pos_B, config.num_contracted,
             config.batch_pos_B, config.num_batch);
-
         auto it = a_map.find(key);
         if (it == a_map.end()) continue;
+        b_matches[static_cast<size_t>(bi)] = &it->second;
+        total_pairs += it->second.size();
+    }
 
-        for (int32_t ai : it->second) {
+    std::vector<BlockPairInfo> pairs;
+    pairs.reserve(total_pairs);
+    for (int32_t bi = 0; bi < B_gpu.num_blocks; ++bi) {
+        const auto* matches = b_matches[static_cast<size_t>(bi)];
+        if (!matches) continue;
+        for (int32_t ai : *matches) {
             BlockPairInfo info;
             info.block_idx_A = ai;
             info.block_idx_B = bi;
@@ -124,17 +135,27 @@ std::vector<BlockPairInfo> find_matching_pairs_dynamic(
         a_map[key].push_back(ai);
     }
 
-    std::vector<BlockPairInfo> pairs;
+    // Probe phase with exact precount (see find_matching_pairs_impl).
+    std::vector<const std::vector<int32_t>*> b_matches(
+        static_cast<size_t>(B_gpu.num_blocks), nullptr);
+    size_t total_pairs = 0;
     for (int32_t bi = 0; bi < B_gpu.num_blocks; ++bi) {
         auto key = extract_match_key_dynamic(
             B_gpu.block_coords.data(), B_gpu.rank, bi,
             config.contracted_pos_B, config.num_contracted,
             config.batch_pos_B, config.num_batch);
-
         auto it = a_map.find(key);
         if (it == a_map.end()) continue;
+        b_matches[static_cast<size_t>(bi)] = &it->second;
+        total_pairs += it->second.size();
+    }
 
-        for (int32_t ai : it->second) {
+    std::vector<BlockPairInfo> pairs;
+    pairs.reserve(total_pairs);
+    for (int32_t bi = 0; bi < B_gpu.num_blocks; ++bi) {
+        const auto* matches = b_matches[static_cast<size_t>(bi)];
+        if (!matches) continue;
+        for (int32_t ai : *matches) {
             BlockPairInfo info;
             info.block_idx_A = ai;
             info.block_idx_B = bi;

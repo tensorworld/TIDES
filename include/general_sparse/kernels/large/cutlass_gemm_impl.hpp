@@ -15,6 +15,26 @@
 
 namespace bsptc {
 
+// Generate batch-expanded leading dims from the descs into the pinned staging
+// regions (h_ptrs[5..8]). One sequential pass per region: interleaving the
+// four streams with the coord loop measurably hurts pinned-memory write
+// locality at high problem counts.
+template <typename Element>
+static void fill_leading_dims(const LargeBlockWork<Element>& work,
+                              void* const (&h_ptrs)[9]) {
+    auto fill = [&](void* dst, auto pick) {
+        auto* out = static_cast<int64_t*>(dst);
+        size_t idx = 0;
+        for (const auto& prob : work.problems)
+            for (int64_t b = 0; b < prob.batch_size; ++b)
+                out[idx++] = pick(prob);
+    };
+    fill(h_ptrs[5], [](const GemmProblemDesc& p) { return p.lda; });
+    fill(h_ptrs[6], [](const GemmProblemDesc& p) { return p.ldb; });
+    fill(h_ptrs[7], [](const GemmProblemDesc& p) { return p.ldc; });
+    fill(h_ptrs[8], [](const GemmProblemDesc& p) { return p.ldc; });  // D = C
+}
+
 // Prepare CUTLASS GEMM: allocate unified arg buffer + pinned staging, fill,
 // async H2D, construct Gemm::Arguments.  Returns runner + buffers to free.
 // No workspace (kDeviceOnly scheduling).
@@ -44,9 +64,10 @@ static CutlassGemmRunnerResult prepare_cutlass_gemm_impl(
     const size_t d_total = total_allocation_size(sizes);
     const size_t h_total = d_total + sizes[0]; // staging + persistent h_problem_sizes
 
-    // Allocate device and pinned host buffers
-    check_cuda(cudaMalloc(&result.d_args_buf, d_total), "prepare_gemm: malloc args");
-    check_cuda(cudaMallocHost(&result.h_args_buf, h_total), "prepare_gemm: malloc pinned");
+    // Acquire device and pinned host buffers from the process-wide pools
+    // (avoids ~1 ms cudaMallocHost page-pinning per call)
+    result.d_args_buf = device_args_pool().acquire(d_total);
+    result.h_args_buf = pinned_args_pool().acquire(h_total);
 
     // Resolve device pointers
     void* d_ptrs[9];
@@ -74,6 +95,7 @@ static CutlassGemmRunnerResult prepare_cutlass_gemm_impl(
             ++prob_idx;
         }
     }
+    fill_leading_dims(work, h_ptrs);
 
     // Store patching locations
     result.d_ptr_A_loc = d_ptrs[1];
@@ -86,10 +108,6 @@ static CutlassGemmRunnerResult prepare_cutlass_gemm_impl(
     std::memcpy(h_ptrs[2], work.ptr_B.data(), sizes[2]);
     std::memcpy(h_ptrs[3], work.ptr_C.data(), sizes[3]);
     std::memcpy(h_ptrs[4], work.ptr_C.data(), sizes[4]); // D = C
-    std::memcpy(h_ptrs[5], work.lda.data(), sizes[5]);
-    std::memcpy(h_ptrs[6], work.ldb.data(), sizes[6]);
-    std::memcpy(h_ptrs[7], work.ldc.data(), sizes[7]);
-    std::memcpy(h_ptrs[8], work.ldd.data(), sizes[8]);
 
     // Single async H2D transfer
     check_cuda(cudaMemcpyAsync(result.d_args_buf, result.h_args_buf, d_total,
@@ -99,6 +117,9 @@ static CutlassGemmRunnerResult prepare_cutlass_gemm_impl(
     // Construct Gemm::Arguments
     int threadblock_count = Gemm::sufficient(h_problem_sizes, problem_count);
     if (threadblock_count == 0) {
+        // Drain the in-flight H2D copy before returning buffers to the pool
+        // (pool release does not synchronize, unlike cudaFreeHost).
+        cudaStreamSynchronize(stream);
         result.free_buffers();
         throw std::runtime_error("CUTLASS: insufficient resources for grouped GEMM");
     }
@@ -183,6 +204,7 @@ static void fill_cutlass_args_impl(
             ++prob_idx;
         }
     }
+    fill_leading_dims(work, h_ptrs);
 
     result.d_ptr_A_loc = d_ptrs[1];
     result.d_ptr_B_loc = d_ptrs[2];
@@ -194,10 +216,6 @@ static void fill_cutlass_args_impl(
     std::memcpy(h_ptrs[2], work.ptr_B.data(), sizes[2]);
     std::memcpy(h_ptrs[3], work.ptr_C.data(), sizes[3]);
     std::memcpy(h_ptrs[4], work.ptr_C.data(), sizes[4]);
-    std::memcpy(h_ptrs[5], work.lda.data(), sizes[5]);
-    std::memcpy(h_ptrs[6], work.ldb.data(), sizes[6]);
-    std::memcpy(h_ptrs[7], work.ldc.data(), sizes[7]);
-    std::memcpy(h_ptrs[8], work.ldd.data(), sizes[8]);
 
     check_cuda(cudaMemcpyAsync(result.d_args_buf, result.h_args_buf, d_total,
                                 cudaMemcpyHostToDevice, stream),

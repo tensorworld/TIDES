@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Plot benchmark results.
 
-Auto-discovers the latest result directories under ./results/ (override with
-$TIDES_RESULTS_BASE), or accepts explicit paths via CLI flags.
+Auto-discovers the latest result directories under ~/data/block_sparse_dev/results/,
+or accepts explicit paths via CLI flags.
 
 Generates:
   1. Synthetic Fig1: kernel speedup vs M/N-equiv (exec only, no setup)
@@ -37,7 +37,7 @@ from matplotlib.colors import TwoSlopeNorm
 
 # ── Defaults ───────────────────────────────────────────────────────────
 
-RESULTS_BASE = os.environ.get("TIDES_RESULTS_BASE", "results")
+RESULTS_BASE = os.path.expanduser("~/data/block_sparse_dev/results")
 
 # Populated by main() from args or auto-discovery
 COMMIT = ""
@@ -358,8 +358,9 @@ def _match_cherry(name, picks):
 def plot_pipeline(f32_csv, f64_csv, out_dir, cherry_pick=None):
     """Bar chart: pipeline vs cuTENSOR, capped at PIPE_CAP, geomean line.
 
-    speedup in CSV = cutlass_ms / cutensor_ms (lower = pipeline faster).
-    Plot cuTENSOR_ms / pipeline_ms so >1 = pipeline wins.
+    Recompute cuTENSOR_ms / pipeline_ms so >1 = pipeline wins.  This avoids
+    relying on historical CSVs whose old generic speedup field had the inverse
+    orientation; current pipeline CSVs call the field tides_speedup.
     """
     f32 = read_csv(f32_csv)
     f64 = read_csv(f64_csv)

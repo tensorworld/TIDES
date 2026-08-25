@@ -15,6 +15,12 @@ namespace bsptc {
 
 constexpr int WARP_MAX_DIMS = 4;
 
+// Minimum K for routing an M=N=1 (scalar output) shape to the dot-reduce
+// kernel instead of the warp GEMM. Below this, one serial lane is cheap and
+// per-CTA setup isn't worth it; above, the warp kernel's one-active-lane
+// mapping serializes K catastrophically (DMRG Lanczos dots reach K ~ 40k).
+constexpr dim_t DOT_MIN_K = 128;
+
 // --- Building blocks for the large free dim ---
 struct StdDim { dim_t stride; };
 struct IntDim {

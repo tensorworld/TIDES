@@ -3,6 +3,8 @@
 
 #include "general_sparse/kernels/large/cutlass_grouped_fwd.hpp"
 #include "general_sparse/kernels/large/cutlass_tile_shapes.hpp"
+#include "general_sparse/kernels/large/cublas_grouped_fwd.hpp"
+#include "general_sparse/kernels/large/large_backend.hpp"
 
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -89,7 +91,7 @@ static int get_device_sm_version() {
 // ============================================================================
 
 template <>
-CutlassGemmRunnerResult prepare_cutlass_gemm_dispatch<float>(
+CutlassGemmRunnerResult prepare_cutlass_tile_dispatch<float>(
     const LargeBlockWork<float>& work, float alpha, float beta,
     TileShape tile, cudaStream_t stream)
 {
@@ -108,7 +110,7 @@ CutlassGemmRunnerResult prepare_cutlass_gemm_dispatch<float>(
 }
 
 template <>
-CutlassGemmRunnerResult prepare_cutlass_gemm_dispatch<double>(
+CutlassGemmRunnerResult prepare_cutlass_tile_dispatch<double>(
     const LargeBlockWork<double>& work, double alpha, double beta,
     TileShape tile, cudaStream_t stream)
 {
@@ -135,7 +137,7 @@ CutlassGemmRunnerResult prepare_cutlass_gemm_dispatch<double>(
 }
 
 template <>
-void fill_cutlass_args_dispatch<float>(
+void fill_cutlass_tile_dispatch<float>(
     CutlassGemmRunnerResult& result,
     const LargeBlockWork<float>& work, float alpha, float beta,
     TileShape tile, cudaStream_t stream)
@@ -155,7 +157,7 @@ void fill_cutlass_args_dispatch<float>(
 }
 
 template <>
-void fill_cutlass_args_dispatch<double>(
+void fill_cutlass_tile_dispatch<double>(
     CutlassGemmRunnerResult& result,
     const LargeBlockWork<double>& work, double alpha, double beta,
     TileShape tile, cudaStream_t stream)
@@ -195,6 +197,44 @@ void fill_cutlass_args_dispatch<double>(
     }
     throw std::runtime_error("Unsupported TileShape (double)");
 }
+
+// ============================================================================
+// Backend dispatch — the entry points the pipeline calls
+// ============================================================================
+// KernelChoice carries the backend; the tile inside it is only meaningful for
+// CUTLASS.  Both backends return the same runner type, so everything downstream
+// (pointer patching, run(stream), buffer pooling) is backend-agnostic.
+
+template <typename T>
+CutlassGemmRunnerResult prepare_large_gemm_dispatch(
+    const LargeBlockWork<T>& work, T alpha, T beta,
+    KernelChoice choice, cudaStream_t stream)
+{
+    if (choice.is_cublas())
+        return prepare_cublas_gemm(work, alpha, beta, stream);
+    return prepare_cutlass_tile_dispatch<T>(work, alpha, beta, choice.tile, stream);
+}
+
+template <typename T>
+void fill_large_args_dispatch(
+    CutlassGemmRunnerResult& result, const LargeBlockWork<T>& work,
+    T alpha, T beta, KernelChoice choice, cudaStream_t stream)
+{
+    if (choice.is_cublas()) {
+        fill_cublas_args(result, work, alpha, beta, stream);
+        return;
+    }
+    fill_cutlass_tile_dispatch<T>(result, work, alpha, beta, choice.tile, stream);
+}
+
+template CutlassGemmRunnerResult prepare_large_gemm_dispatch<float>(
+    const LargeBlockWork<float>&, float, float, KernelChoice, cudaStream_t);
+template CutlassGemmRunnerResult prepare_large_gemm_dispatch<double>(
+    const LargeBlockWork<double>&, double, double, KernelChoice, cudaStream_t);
+template void fill_large_args_dispatch<float>(
+    CutlassGemmRunnerResult&, const LargeBlockWork<float>&, float, float, KernelChoice, cudaStream_t);
+template void fill_large_args_dispatch<double>(
+    CutlassGemmRunnerResult&, const LargeBlockWork<double>&, double, double, KernelChoice, cudaStream_t);
 
 // ============================================================================
 // Utility functions

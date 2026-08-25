@@ -1,4 +1,5 @@
 #include "general_sparse/kernels/small/warp_gemm.cuh"
+#include "general_sparse/kernels/small/dot_reduce.cuh"
 #include "general_sparse/device_props.hpp"
 
 namespace bsptc {
@@ -116,5 +117,41 @@ template void launch_warp_gemm<double>(
     const void* d_shapes, const WarpMem* d_mems,
     const int32_t* d_warp_prefix, int num_descs,
     int total_warps, int variant, cudaStream_t stream);
+
+// ============================================================================
+// Dot-reduce launch (scalar-output small-tier descs; see dot_reduce.cuh)
+// ============================================================================
+
+template <typename T>
+void launch_dot_reduce(const void* d_shapes, const WarpMem* d_mems,
+                       const int32_t* d_dot_indices, int num_dots,
+                       int variant, cudaStream_t stream)
+{
+    if (num_dots == 0) return;
+    const bool il = (variant & 8) != 0;
+    const bool ik = (variant & 4) != 0;
+
+    #define DOT_CASE(IL, IK) \
+        { using ST = WarpShape<std::conditional_t<IL, IntDim, StdDim>, \
+                               std::conditional_t<IK, IntK, StdK>>; \
+          dot_reduce_kernel<T, IL, IK> \
+              <<<num_dots, DOT_REDUCE_BLOCK, 0, stream>>>( \
+                  static_cast<const ST*>(d_shapes), d_mems, \
+                  d_dot_indices, num_dots); }
+
+    if (il) { if (ik) DOT_CASE(true, true)  else DOT_CASE(true, false)  }
+    else    { if (ik) DOT_CASE(false, true) else DOT_CASE(false, false) }
+    #undef DOT_CASE
+}
+
+template void launch_dot_reduce<float>(
+    const void* d_shapes, const WarpMem* d_mems,
+    const int32_t* d_dot_indices, int num_dots,
+    int variant, cudaStream_t stream);
+
+template void launch_dot_reduce<double>(
+    const void* d_shapes, const WarpMem* d_mems,
+    const int32_t* d_dot_indices, int num_dots,
+    int variant, cudaStream_t stream);
 
 } // namespace bsptc

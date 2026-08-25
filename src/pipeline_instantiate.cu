@@ -11,11 +11,11 @@ namespace bsptc {
 template void launch_batched_transpose<float>(const float*, float*, const TransposeFlatMeta&, cudaStream_t);
 template TransposedValues<float> ensure_gemm_layout<float>(const DeviceSparseInput<float>&, const DeviceSparseInput<float>&, const GemmLayoutPlan&, const TransposeFlatMeta&, const TransposeFlatMeta&, float*, float*, cudaStream_t);
 template void free_transposed_values<float>(TransposedValues<float>&);
-template void prepare_small_shapes<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&);
+template bool prepare_small_shapes<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&);
 template void bind_small_mems<float>(PipelinePlan<float>&, const DeviceSparseInput<float>&, const DeviceSparseInput<float>&);
 template bool pipeline_plan<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&, const EinsumIndexSets&, const std::string&, const DispatchConfig&, PipelineTimingBreakdown*, const OutputBlockMap*);
 template PipelineWorkspaceInfo pipeline_query_workspace<float>(const PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&);
-template void pipeline_prepare<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&);
+template bool pipeline_prepare<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&);
 template bool pipeline_allocate<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&, const DeviceSparseInput<float>&, const DeviceSparseInput<float>&, float*, void*, int64_t);
 template bool pipeline_setup<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&, const DeviceSparseInput<float>&, const DeviceSparseInput<float>&, const EinsumIndexSets&, const std::string&, const DispatchConfig&, PipelineTimingBreakdown*, const OutputBlockMap*);
 template void pipeline_execute<float>(PipelinePlan<float>&, const GPUSparseInput<float>&, const GPUSparseInput<float>&, const DeviceSparseInput<float>&, const DeviceSparseInput<float>&);

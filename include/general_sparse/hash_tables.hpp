@@ -26,4 +26,11 @@ int pair_key_dedup(const uint64_t* keys, int n,
                    uint32_t* indices_out,
                    int* first_occurrence_out);
 
+// Group rows of a flat [n * rank] int32 array by row value.
+// Group ids are assigned in first-occurrence order; group_of[i] receives the
+// id of row i (caller allocates n entries). Returns the number of distinct
+// groups. Used by the accumulation-map discovery path (O(n), replaces sort).
+int64_t group_coord_rows(const int32_t* flat_coords, int64_t n, int32_t rank,
+                         int32_t* group_of);
+
 } // namespace bsptc

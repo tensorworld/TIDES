@@ -5,17 +5,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
-project(bsptc LANGUAGES C CXX CUDA)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-
-# Target architecture selection
+# Target architecture selection.
+# Must be resolved BEFORE project(): enabling the CUDA language caches
+# CMAKE_CUDA_ARCHITECTURES from the nvcc default (e.g. 75 on CUDA 13),
+# which would silently override the BSPTC_ARCH mapping below.
 set(BSPTC_ARCH "sm80" CACHE STRING "Target GPU architecture (sm80, sm90, or sm120).")
 set_property(CACHE BSPTC_ARCH PROPERTY STRINGS "sm80" "sm90" "sm120")
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
   if(BSPTC_ARCH STREQUAL "sm120")
     set(CMAKE_CUDA_ARCHITECTURES 120)
   elseif(BSPTC_ARCH STREQUAL "sm90")
@@ -24,6 +20,14 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 80)
   endif()
 endif()
+
+project(bsptc LANGUAGES C CXX CUDA)
+message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES} (BSPTC_ARCH=${BSPTC_ARCH})")
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)
@@ -130,6 +134,15 @@ macro(configure_lib_target tgt)
     $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info>)
 endmacro()
 
+# cuBLAS grouped GEMM backend for the Large tier.
+# Separate TU with no CUTLASS headers (same isolation rule as cuTENSOR).
+add_library(cublas_gemm_lib STATIC ${CMAKE_SOURCE_DIR}/src/cublas/cublas_grouped_gemm.cu)
+target_include_directories(cublas_gemm_lib PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(cublas_gemm_lib PUBLIC CUDA::cublas)
+target_compile_options(cublas_gemm_lib PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${BSPTC_CXX_WARNINGS}>
+  $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info>)
+
 # CUTLASS grouped GEMM instantiations — split per tile shape for parallel compilation
 add_library(cutlass_gemm_lib STATIC
     ${CMAKE_SOURCE_DIR}/src/cutlass/gemm_f32_128x128.cu
@@ -159,6 +172,7 @@ add_library(cutlass_gemm_lib STATIC
     ${CMAKE_SOURCE_DIR}/src/cutlass/gemm_dispatch.cu
 )
 configure_lib_target(cutlass_gemm_lib)
+target_link_libraries(cutlass_gemm_lib PUBLIC cublas_gemm_lib)
 
 # Warp GEMM kernel instantiations (32 template variants × 2 types)
 add_library(warp_gemm_lib STATIC ${CMAKE_SOURCE_DIR}/src/warp_gemm_instantiate.cu)
@@ -188,7 +202,7 @@ add_library(pipeline_f64_lib STATIC ${CMAKE_SOURCE_DIR}/src/pipeline_instantiate
 configure_lib_target(pipeline_f64_lib)
 
 # Convenience variable for targets that need the full pipeline
-set(PIPELINE_LIBS pipeline_f32_lib pipeline_f64_lib warp_gemm_lib cutlass_gemm_lib pair_matching_lib hash_tables_lib)
+set(PIPELINE_LIBS pipeline_f32_lib pipeline_f64_lib warp_gemm_lib cutlass_gemm_lib cublas_gemm_lib pair_matching_lib hash_tables_lib)
 
 # CLI tool for running general sparse contractions
 add_cuda_executable(general_sparse src/general_sparse_main.cu)

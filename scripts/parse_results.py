@@ -47,7 +47,9 @@ class PipelineRow:
     layout: str
     cutlass_ms: float
     cutensor_ms: float
-    speedup: float
+    # Explicit orientation: >1 means TIDES is faster.  The old generic
+    # `speedup` CSV field used the inverse orientation in historical files.
+    tides_speedup: float
     transpose_ms: float
     contract_ms: float
     accumulate_ms: float
@@ -61,6 +63,14 @@ class PipelineRow:
     h2d_mb: float = 0.0
     # EXP-2: setup fairness
     cutlass_setup_ms: float = 0.0
+    tides_prepare_status: str = "not_reported"
+    cutensor_prepare_status: str = "not_reported"
+    tides_host_prepare_ms: float = 0.0
+    tides_device_zero_ms: float = 0.0
+    tides_prepare_ms: float = 0.0
+    cutensor_host_prepare_ms: float = 0.0
+    cutensor_device_zero_ms: float = 0.0
+    cutensor_prepare_ms: float = 0.0
     # EXP-4: per-tier FLOPs and output elements
     large_flops_gflop: float = 0.0
     medium_flops_gflop: float = 0.0
@@ -124,6 +134,14 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
         h2d_ms = 0.0
         h2d_mb = 0.0
         cutlass_setup_ms = 0.0
+        tides_prepare_status = "not_reported"
+        cutensor_prepare_status = "not_reported"
+        tides_host_prepare_ms = 0.0
+        tides_device_zero_ms = 0.0
+        tides_prepare_ms = 0.0
+        cutensor_host_prepare_ms = 0.0
+        cutensor_device_zero_ms = 0.0
+        cutensor_prepare_ms = 0.0
         large_flops = 0.0
         medium_flops = 0.0
         small_flops = 0.0
@@ -144,6 +162,12 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
         i += 1
         while i < len(lines) and (lines[i].startswith('  ') or lines[i] == ''):
             ln = lines[i].strip()
+
+            if ln.startswith('SKIPPED ('):
+                if tides_prepare_status == 'not_reported':
+                    tides_prepare_status = 'case_skipped'
+                if cutensor_prepare_status == 'not_reported':
+                    cutensor_prepare_status = 'case_skipped'
 
             # layout=TN ...
             m2 = re.match(r'layout=(\S+)', ln)
@@ -202,8 +226,46 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
             elif re.search(r'\[small\]\s+descs=(\d+)', ln):
                 small_descs = int(re.search(r'\[small\]\s+descs=(\d+)', ln).group(1))
 
-            # [setup] cutlass_setup=X.XX preproc=X.XX accum_map=X.XX bs_setup=X.XX h2d=X.XX h2d_MB=X.X init=X.XX ms
-            m2 = re.search(r'cutlass_setup=([\d.]+)', ln)
+            # [prepare] tides_status=ok tides_host_prepare_ms=... ...
+            #             cutensor_status=ok cutensor_host_prepare_ms=... ...
+            if ln.startswith('[prepare]'):
+                prepare_fields = dict(re.findall(r'(\w+)=([^\s]+)', ln))
+                tides_prepare_status = prepare_fields.get(
+                    'tides_status', tides_prepare_status)
+                cutensor_prepare_status = prepare_fields.get(
+                    'cutensor_status', cutensor_prepare_status)
+                for key in (
+                    'tides_host_prepare_ms', 'tides_device_zero_ms',
+                    'tides_prepare_ms', 'cutensor_host_prepare_ms',
+                    'cutensor_device_zero_ms', 'cutensor_prepare_ms',
+                ):
+                    if key in prepare_fields:
+                        value = float(prepare_fields[key])
+                        if key == 'tides_host_prepare_ms':
+                            tides_host_prepare_ms = value
+                        elif key == 'tides_device_zero_ms':
+                            tides_device_zero_ms = value
+                        elif key == 'tides_prepare_ms':
+                            tides_prepare_ms = value
+                        elif key == 'cutensor_host_prepare_ms':
+                            cutensor_host_prepare_ms = value
+                        elif key == 'cutensor_device_zero_ms':
+                            cutensor_device_zero_ms = value
+                        elif key == 'cutensor_prepare_ms':
+                            cutensor_prepare_ms = value
+                # The first prepare_ms implementation had totals only.  Mark
+                # those rows explicitly so analyses cannot mistake them for
+                # the new host/zero split.
+                if ('tides_prepare_ms' in prepare_fields and
+                        'tides_status' not in prepare_fields):
+                    tides_prepare_status = 'legacy_total'
+                if ('cutensor_prepare_ms' in prepare_fields and
+                        'cutensor_status' not in prepare_fields):
+                    cutensor_prepare_status = 'legacy_total'
+
+            # [setup_detail] tides_full_setup=X.XX ... (TIDES diagnostics only)
+            # Also accept the legacy cutlass_setup spelling for old logs.
+            m2 = re.search(r'(?:tides_full_setup|cutlass_setup)=([\d.]+)', ln)
             if m2:
                 cutlass_setup_ms = float(m2.group(1))
             m2 = re.search(r'preproc=([\d.]+)', ln)
@@ -233,11 +295,15 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
             if m2:
                 gflops_per_s = float(m2.group(1))
 
-            # [bs_cutensor] setup=1.64 kernel=0.27 ms  peak=41.4 MB
+            # Legacy: [bs_cutensor] setup=1.64 kernel=0.27 ms peak=41.4 MB
             m2 = re.match(r'\[bs_cutensor\]\s+setup=([\d.]+)\s+kernel=[\d.]+\s*ms\s+peak=([\d.]+)', ln)
             if m2:
                 cutensor_setup_ms = float(m2.group(1))
                 cutensor_peak_mb = float(m2.group(2))
+            # Current: [bs_cutensor] kernel=0.27 ms peak=41.4 MB
+            m2 = re.match(r'\[bs_cutensor\]\s+kernel=[\d.]+\s*ms\s+peak=([\d.]+)', ln)
+            if m2:
+                cutensor_peak_mb = float(m2.group(1))
 
             # [streaming] 2 batches  buf=7 MB x2  precomp=0 KB  Square=1925p/1b/32x32  SkinnyTall=...
             m2 = re.match(r'\[streaming\]\s+(\d+)\s+batch', ln)
@@ -258,7 +324,7 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
 
             i += 1
 
-        speedup = cutlass_ms / cutensor_ms if cutensor_ms > 0 else 0.0
+        tides_speedup = cutensor_ms / cutlass_ms if cutensor_ms > 0 and cutlass_ms > 0 else 0.0
         data_layout, symmetry, size = extract_layout_info(case_name)
 
         rows.append(PipelineRow(
@@ -269,7 +335,7 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
             layout=layout,
             cutlass_ms=cutlass_ms,
             cutensor_ms=cutensor_ms,
-            speedup=round(speedup, 3),
+            tides_speedup=round(tides_speedup, 3),
             transpose_ms=transpose_ms,
             contract_ms=contract_ms,
             accumulate_ms=accumulate_ms,
@@ -281,6 +347,14 @@ def parse_pipeline(text: str) -> List[PipelineRow]:
             h2d_ms=h2d_ms,
             h2d_mb=h2d_mb,
             cutlass_setup_ms=cutlass_setup_ms,
+            tides_prepare_status=tides_prepare_status,
+            cutensor_prepare_status=cutensor_prepare_status,
+            tides_host_prepare_ms=tides_host_prepare_ms,
+            tides_device_zero_ms=tides_device_zero_ms,
+            tides_prepare_ms=tides_prepare_ms,
+            cutensor_host_prepare_ms=cutensor_host_prepare_ms,
+            cutensor_device_zero_ms=cutensor_device_zero_ms,
+            cutensor_prepare_ms=cutensor_prepare_ms,
             large_flops_gflop=large_flops,
             medium_flops_gflop=medium_flops,
             small_flops_gflop=small_flops,
@@ -872,7 +946,7 @@ def _tier_summary(rows: List[PipelineRow]):
             cat = "can" if "canonical" in name else ("int" if "internal" in name else "mat")
             name = f"[{cat}] {parts[1]}"
         print(f"{name:<50} {r.large_problems:>5} {r.medium_descs:>5} {r.small_descs:>5} "
-              f"{lp:>4.0f}% {mp:>4.0f}% {sp:>4.0f}% {has_trans:>5} {r.speedup:>5.2f}x",
+              f"{lp:>4.0f}% {mp:>4.0f}% {sp:>4.0f}% {has_trans:>5} {r.tides_speedup:>5.2f}x",
               file=sys.stderr)
     print(file=sys.stderr)
 

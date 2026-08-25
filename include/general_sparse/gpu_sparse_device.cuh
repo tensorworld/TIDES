@@ -9,11 +9,13 @@
 // Device-side data structures for GPU sparse tensor operations.
 namespace bsptc {
 
-// Device pointers for GPU sparse input (move-only, frees GPU memory on destruction)
+// Device pointers for GPU sparse input (move-only, frees GPU memory on destruction
+// unless borrowing caller-owned storage — see borrow_device_input).
 // Only d_values is uploaded; block metadata stays on host.
 template <typename T>
 struct DeviceSparseInput {
     T* d_values = nullptr;
+    bool owns = true;
 
     dim_t rank = 0;
     dim_t num_blocks = 0;
@@ -21,10 +23,10 @@ struct DeviceSparseInput {
 
     DeviceSparseInput() = default;
     ~DeviceSparseInput() {
-        if (d_values) cudaFree(d_values);
+        if (owns && d_values) cudaFree(d_values);
     }
     DeviceSparseInput(DeviceSparseInput&& o) noexcept
-        : d_values(o.d_values),
+        : d_values(o.d_values), owns(o.owns),
           rank(o.rank), num_blocks(o.num_blocks), total_elements(o.total_elements)
     {
         o.d_values = nullptr;
@@ -36,6 +38,20 @@ struct DeviceSparseInput {
     DeviceSparseInput(const DeviceSparseInput&) = delete;
     DeviceSparseInput& operator=(const DeviceSparseInput&) = delete;
 };
+
+// Wrap caller-owned device storage (e.g. a Julia CuArray) without taking
+// ownership — the destructor will not free d_values.
+template <typename T>
+DeviceSparseInput<T> borrow_device_input(T* d_values, dim_t rank,
+                                         dim_t num_blocks, int64_t total_elements) {
+    DeviceSparseInput<T> dev;
+    dev.d_values = d_values;
+    dev.owns = false;
+    dev.rank = rank;
+    dev.num_blocks = num_blocks;
+    dev.total_elements = total_elements;
+    return dev;
+}
 
 // Block pair info for matched blocks
 struct BlockPairInfo {

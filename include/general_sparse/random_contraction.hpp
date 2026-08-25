@@ -45,6 +45,8 @@ struct RandomContractionParams {
     int min_nnz         = 1;      // Floor on nnz per tensor
 
     bool shuffle_labels = true;   // Shuffle index ordering within tensors
+    bool shuffle_output = true;   // Shuffle einsum output label order (exercises
+                                  // the post-contraction output permute)
 
     // Per-role section size overrides (0 = use global min/max_section_size).
     int small_free_A_lo = 0;    // Override min section size for free_A labels
@@ -223,11 +225,20 @@ inline RandomContraction generate_random_contraction(
     output_labels.insert(output_labels.end(), free_A_labels.begin(), free_A_labels.end());
     output_labels.insert(output_labels.end(), free_B_labels.begin(), free_B_labels.end());
 
-    // Shuffle A and B orderings if requested (produces interleaved/transposed layouts)
+    // Shuffle A and B orderings if requested (produces interleaved/transposed
+    // layouts). Batch labels stay fixed as the leading prefix, in the same
+    // order in both operands — the pipeline rejects contractions whose batch
+    // dims are not leading in canonical order (batch-leftmost invariant).
     if (params.shuffle_labels) {
-        std::shuffle(A_labels.begin(), A_labels.end(), rng);
-        std::shuffle(B_labels.begin(), B_labels.end(), rng);
+        auto nb = static_cast<std::ptrdiff_t>(batch_labels.size());
+        std::shuffle(A_labels.begin() + nb, A_labels.end(), rng);
+        std::shuffle(B_labels.begin() + nb, B_labels.end(), rng);
     }
+
+    // Shuffle the einsum output order (any permutation is legal for the
+    // output) so the post-contraction permute stage gets fuzzed.
+    if (params.shuffle_output)
+        std::shuffle(output_labels.begin(), output_labels.end(), rng);
 
     // 4. Build BlockSparseTensor for A and B
     int64_t host_elems_total = 0;  // running count for early memory check

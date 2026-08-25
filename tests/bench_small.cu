@@ -710,7 +710,8 @@ static EinsumBenchResult bench_one_einsum(
         auto triv_A = compute_trivial_shapes(smap_A, &idx_A);
         std::vector<int> all_A(A_gpu.num_blocks);
         std::iota(all_A.begin(), all_A.end(), 0);
-        precomp_A = assemble_hypertile_batch<T>(all_A, A_gpu, smap_A, idx_A, triv_A, {}, nullptr, stream);
+        precomp_A = assemble_hypertile_batch(all_A, A_gpu.block_offsets.data(),
+            A_gpu.block_volumes.data(), smap_A, idx_A, triv_A, {}, nullptr, stream);
     }
     if (layout_plan.plan_B.transpose) {
         auto smap_B = build_block_shape_map(B_gpu.block_dims.data(), B_gpu.num_blocks, B_gpu.rank);
@@ -718,7 +719,8 @@ static EinsumBenchResult bench_one_einsum(
         auto triv_B = compute_trivial_shapes(smap_B, &idx_B);
         std::vector<int> all_B(B_gpu.num_blocks);
         std::iota(all_B.begin(), all_B.end(), 0);
-        precomp_B = assemble_hypertile_batch<T>(all_B, B_gpu, smap_B, idx_B, triv_B, {}, nullptr, stream);
+        precomp_B = assemble_hypertile_batch(all_B, B_gpu.block_offsets.data(),
+            B_gpu.block_volumes.data(), smap_B, idx_B, triv_B, {}, nullptr, stream);
     }
     cudaDeviceSynchronize();
 

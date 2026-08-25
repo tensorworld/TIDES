@@ -641,7 +641,7 @@ static void run_batched_bench(int warmup, int repeat, cudaStream_t stream, uint3
                     if (total_bytes > 4LL * 1024 * 1024 * 1024) {
                         printf("%-12s %-22s %8d %10s %10s %10s %10s %8s\n",
                                perm_str.c_str(), shape_str.c_str(), num_blocks,
-                               "OOM", "-", "-", "-", "-");
+                               "SKIP", "-", "-", "-", "-");
                         continue;
                     }
 
@@ -754,7 +754,7 @@ static void run_mixed_bench(int warmup, int repeat, cudaStream_t stream) {
             int64_t total_bytes = total_vol * static_cast<int64_t>(sizeof(T));
             if (total_bytes > 4LL * 1024 * 1024 * 1024) {
                 printf("%-8s %6s %8d %6d %10s %10s %10s\n",
-                       "reverse", "mixed", total_blocks, rank, "OOM", "-", "-");
+                       "reverse", "mixed", total_blocks, rank, "SKIP", "-", "-");
                 continue;
             }
 
@@ -1715,7 +1715,7 @@ static void bench_exp1b_b_operand(
     if (total_bytes > 4LL * 1024 * 1024 * 1024) {
         printf("%-46s %2s %-18s %6d %6d %10s %10s %10s %8s %8s %8s\n",
                case_name.c_str(), op_label, perm_str.c_str(), num_shapes, num_blocks,
-               "OOM", "-", "-", "-", "-", "-");
+               "SKIP", "-", "-", "-", "-", "-");
         return;
     }
 
@@ -2154,7 +2154,7 @@ static void run_grouped_bench(const std::string& data_root, uint32_t seed,
         int64_t total_bytes = total_vol * static_cast<int64_t>(sizeof(T));
         if (total_bytes > 4LL * 1024 * 1024 * 1024) {
             printf("%-50s %6d %6d %10s %10s %10s %8s %8s %8s\n",
-                   dirname.c_str(), num_shapes, num_blocks, "OOM", "-", "-", "-", "-", "-");
+                   dirname.c_str(), num_shapes, num_blocks, "SKIP", "-", "-", "-", "-", "-");
             continue;
         }
 

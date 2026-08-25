@@ -495,8 +495,9 @@ int process_operand(
         std::iota(blocks.begin(), blocks.end(), 0);
     }
 
-    TransposeFlatMeta meta = assemble_hypertile_batch<T>(
-        blocks, gpu, smap, idx, triv, {}, nullptr, stream);
+    TransposeFlatMeta meta = assemble_hypertile_batch(
+        blocks, gpu.block_offsets.data(), gpu.block_volumes.data(),
+        smap, idx, triv, {}, nullptr, stream);
     cudaStreamSynchronize(stream);
 
     std::cout << "\n=== " << name << " Transpose Kernel ===\n"
@@ -939,8 +940,9 @@ BenchResult bench_operand_transpose(
 
     std::vector<int> all_blocks(gpu.num_blocks);
     std::iota(all_blocks.begin(), all_blocks.end(), 0);
-    TransposeFlatMeta meta = assemble_hypertile_batch<T>(
-        all_blocks, gpu, smap, idx, triv, {}, nullptr, stream);
+    TransposeFlatMeta meta = assemble_hypertile_batch(
+        all_blocks, gpu.block_offsets.data(), gpu.block_volumes.data(),
+        smap, idx, triv, {}, nullptr, stream);
     cudaStreamSynchronize(stream);
     g_use_search_tiler = false;
 

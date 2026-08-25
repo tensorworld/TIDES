@@ -6,6 +6,8 @@
 #include "preprocessing_kernel.cuh"
 #include "gemm_layout_check.hpp"
 #include "kernels/large/cutlass_tile_shapes.hpp"
+#include "kernels/large/shape_queue.hpp"
+#include "kernels/large/large_backend.hpp"
 #include "tile_efficiency.hpp"
 #include "device_props.hpp"
 
@@ -13,6 +15,9 @@
 #include <cstdint>
 #include <algorithm>
 #include <type_traits>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 
 // Work partitioning for dispatching block pairs to different execution paths.
 // Warp (registers) / Volume (SMEM) / CUTLASS (global memory).
@@ -42,88 +47,52 @@ constexpr int VOL_MAX_TILES = 256;
 // aren't justified without transpose avoidance.
 constexpr int VOL_MAX_TILES_NO_TRANSPOSE = 64;
 
-// Default threshold for routing to CUTLASS grouped GEMM.
-// Blocks with M*N >= threshold are considered "large".
-constexpr int64_t DEFAULT_CUTLASS_MN_THRESHOLD = 4096;  // 64*64
-
 // Minimum individual dimension for CUTLASS dispatch.
 // Warp GEMM handles very small M or N (< 4) with max dim ≤ 1024;
 // larger problems route to CUTLASS skinny tiles even with tiny min dim.
 constexpr int64_t MIN_CUTLASS_DIM = 4;
 constexpr int64_t MAX_WARP_DIM = 1024;
 
-// Build a GemmProblemDesc with common fields filled in.
-template <typename T>
-inline GemmProblemDesc make_gemm_problem_desc(
-    int32_t pair_idx, const BlockPairInfo& pair,
-    const GPUSparseInput<T>& A_gpu, const GPUSparseInput<T>& B_gpu,
-    const ContractionConfig& config, GemmMode gemm_mode)
-{
-    GemmProblemDesc desc{};
-    desc.pair_idx = pair_idx;
-    desc.block_idx_A = pair.block_idx_A;
-    desc.block_idx_B = pair.block_idx_B;
-    compute_gemm_dimensions(A_gpu, B_gpu, pair.block_idx_A, pair.block_idx_B,
-                            config, desc.M, desc.N, desc.K, desc.batch_size);
-    desc.lda = gemm_mode_a_transposed(gemm_mode) ? desc.M : desc.K;
-    desc.ldb = gemm_mode_b_transposed(gemm_mode) ? desc.K : desc.N;
-    desc.ldc = desc.N;
-    desc.offset_A = A_gpu.block_offsets[pair.block_idx_A];
-    desc.offset_B = B_gpu.block_offsets[pair.block_idx_B];
-    return desc;
-}
+// One entry per unique (shape_A, shape_B) pair: GEMM geometry and tier,
+// computed once by build_shape_pair_plan (pipeline.cuh) and consumed per pair
+// by partition_by_threshold via table lookup.
+struct ShapePairInfo {
+    dim_t M, N, K;
+    dim_t batch_size;
+    dim_t lda, ldb, ldc;
+    uint8_t tier;   // 0 = warp, 1 = volume, 2 = CUTLASS
+};
+
+// Unique shape-pair plan: pair_shape_id[i] indexes shape_pairs for pair i.
+struct ShapePairPlan {
+    std::vector<uint32_t> pair_shape_id;   // [num_pairs]
+    std::vector<ShapePairInfo> shape_pairs; // [num unique shape pairs]
+};
 
 // Partition block pairs into three tiers per the dispatch routing design:
 //   1. Warp (small):  min(M,N) < 4 AND max(M,N) ≤ 1024 — register-based, no transpose
 //   2. Volume (medium): ceil(M/2)*ceil(N/2) ≤ tile_limit AND M*K+N*K ≤ vol_threshold<T>()
-//      tile_limit = 256 when transpose needed (volume skips transpose),
-//                   64 when no transpose (volume's only edge is persistent dispatch)
 //   3. CUTLASS (large): everything else — needs transpose
-// Pure classification — no device pointers, no buffer dependencies.
-// Pointer arrays are built separately by build_large_pointers().
-// volume_eligible is always true in normal operation; the post-squash rank guard
-// in setup_medium_volume_descs handles any rank overflow.
+// The tier rules (including the squashed-rank eligibility that routes
+// overflow shapes to CUTLASS) are evaluated once per unique shape pair in
+// build_shape_pair_plan (pipeline.cuh); per-pair work here is a table lookup
+// plus block-offset reads. Pure assembly — no device pointers, no buffer
+// dependencies. Pointer arrays are bound per queue by bind_queue_pointers().
 template <typename T>
 PartitionedWork<T> partition_by_threshold(
     const GPUSparseInput<T>& A_gpu,
     const GPUSparseInput<T>& B_gpu,
     const std::vector<BlockPairInfo>& pairs,
-    const ContractionConfig& config,
-    GemmMode gemm_mode = GemmMode::NN,
-    bool volume_eligible = true,
-    bool needs_transpose = false,
-    int vol_max_tiles_override = 0)
+    const ShapePairPlan& sp,
+    GemmMode gemm_mode)
 {
     PartitionedWork<T> result;
-    result.all_pairs = pairs;
     result.large.gemm_mode = gemm_mode;
 
-    // Volume shape gate: tiles ≤ 256 (8-warp CTA) when transpose is
-    // needed, tiles ≤ 64 (2-warp CTA) otherwise.  Override via config.
-    const int vol_tile_limit = (vol_max_tiles_override > 0)
-        ? vol_max_tiles_override
-        : (needs_transpose ? VOL_MAX_TILES : VOL_MAX_TILES_NO_TRANSPOSE);
-
-    // ---- Pass 1: compute per-pair tier assignment ----
-    // 0 = warp, 1 = volume, 2 = CUTLASS
-    std::vector<int> per_pair_tier(pairs.size());
-    for (size_t i = 0; i < pairs.size(); ++i) {
-        const BlockPairInfo& pair = pairs[i];
-        auto desc = make_gemm_problem_desc(
-            static_cast<int32_t>(i), pair, A_gpu, B_gpu, config, gemm_mode);
-
-        if (std::min(desc.M, desc.N) < MIN_CUTLASS_DIM &&
-            std::max(desc.M, desc.N) <= MAX_WARP_DIM) {
-            per_pair_tier[i] = 0;  // warp
-        } else if (volume_eligible &&
-                   vol_tile_count(desc.M, desc.N) <= vol_tile_limit &&
-                   (static_cast<int64_t>(desc.M) * desc.K +
-                    static_cast<int64_t>(desc.N) * desc.K) <= vol_threshold<T>()) {
-            per_pair_tier[i] = 1;  // volume
-        } else {
-            per_pair_tier[i] = 2;  // CUTLASS
-        }
-    }
+    // ---- Pass 1: tier counts so pass 2 can reserve exactly ----
+    size_t tier_counts[3] = {0, 0, 0};
+    for (size_t i = 0; i < pairs.size(); ++i)
+        tier_counts[sp.shape_pairs[sp.pair_shape_id[i]].tier]++;
 
     // No promotion: volume and CUTLASS pairs can coexist for the same output
     // block.  Volume writes to d_output with atomicAdd; CUTLASS writes to
@@ -132,16 +101,36 @@ PartitionedWork<T> partition_by_threshold(
     // Direct-write for CUTLASS is disabled on mixed blocks (see pipeline.cuh).
 
     // ---- Pass 2: build partitioned work (problems only, no pointers) ----
+    result.small.pair_indices.reserve(tier_counts[0]);
+    result.small.problems.reserve(tier_counts[0]);
+    result.medium.pair_indices.reserve(tier_counts[1]);
+    result.medium.problems.reserve(tier_counts[1]);
+    result.large.problems.reserve(tier_counts[2]);
     for (size_t i = 0; i < pairs.size(); ++i) {
         const BlockPairInfo& pair = pairs[i];
-        auto desc = make_gemm_problem_desc(
-            static_cast<int32_t>(i), pair, A_gpu, B_gpu, config, gemm_mode);
+        const uint32_t sid = sp.pair_shape_id[i];
+        const ShapePairInfo& info = sp.shape_pairs[sid];
 
-        if (per_pair_tier[i] == 0) {
+        GemmProblemDesc desc{};
+        desc.pair_idx = static_cast<int32_t>(i);
+        desc.block_idx_A = pair.block_idx_A;
+        desc.block_idx_B = pair.block_idx_B;
+        desc.M = info.M;
+        desc.N = info.N;
+        desc.K = info.K;
+        desc.batch_size = info.batch_size;
+        desc.lda = info.lda;
+        desc.ldb = info.ldb;
+        desc.ldc = info.ldc;
+        desc.offset_A = A_gpu.block_offsets[pair.block_idx_A];
+        desc.offset_B = B_gpu.block_offsets[pair.block_idx_B];
+        desc.shape_pair_id = sid;
+
+        if (info.tier == 0) {
             result.small.pair_indices.push_back(static_cast<int64_t>(i));
             result.small.total_output_elements += pair.output_volume;
             result.small.problems.push_back(desc);
-        } else if (per_pair_tier[i] == 1) {
+        } else if (info.tier == 1) {
             result.medium.pair_indices.push_back(static_cast<int64_t>(i));
             result.medium.total_output_elements += pair.output_volume;
             result.medium.problems.push_back(desc);
@@ -157,11 +146,13 @@ PartitionedWork<T> partition_by_threshold(
     return result;
 }
 
-// Build pointer arrays (ptr_A/B/C, lda/ldb/ldc/ldd) for CUTLASS grouped GEMM.
-// Called after temp buffer is allocated and reduction plan is built.
+// Bind batch-expanded pointer arrays (ptr_A/B/C) directly onto one shape
+// queue's work. Called after the temp buffer is allocated and the reduction
+// plan is built. Leading dimensions are not materialized — the CUTLASS
+// arg-staging loop generates them from the descs.
 template <typename T>
-void build_large_pointers(
-    LargeBlockWork<T>& large,
+void bind_queue_pointers(
+    LargeBlockWork<T>& queue,
     const std::vector<BlockPairInfo>& pairs,
     T* d_A_values,
     T* d_B_values,
@@ -170,25 +161,16 @@ void build_large_pointers(
     const int64_t* pair_dest_offsets,
     const uint8_t* pair_direct_write)
 {
-    if (large.empty()) return;
+    if (queue.empty()) return;
 
-    large.ptr_A.clear();
-    large.ptr_B.clear();
-    large.ptr_C.clear();
-    large.lda.clear();
-    large.ldb.clear();
-    large.ldc.clear();
-    large.ldd.clear();
+    queue.ptr_A.clear();
+    queue.ptr_B.clear();
+    queue.ptr_C.clear();
+    queue.ptr_A.reserve(queue.num_gemm_problems);
+    queue.ptr_B.reserve(queue.num_gemm_problems);
+    queue.ptr_C.reserve(queue.num_gemm_problems);
 
-    large.ptr_A.reserve(large.num_gemm_problems);
-    large.ptr_B.reserve(large.num_gemm_problems);
-    large.ptr_C.reserve(large.num_gemm_problems);
-    large.lda.reserve(large.num_gemm_problems);
-    large.ldb.reserve(large.num_gemm_problems);
-    large.ldc.reserve(large.num_gemm_problems);
-    large.ldd.reserve(large.num_gemm_problems);
-
-    for (const auto& prob : large.problems) {
+    for (const auto& prob : queue.problems) {
         const bool write_direct_to_final =
             (pair_direct_write[prob.pair_idx] != 0);
         const int64_t pair_output_offset = write_direct_to_final
@@ -200,14 +182,9 @@ void build_large_pointers(
         int64_t C_batch_stride = static_cast<int64_t>(prob.M) * prob.N;
 
         for (int64_t b = 0; b < prob.batch_size; ++b) {
-            large.ptr_A.push_back(d_A_values + prob.offset_A + b * A_batch_stride);
-            large.ptr_B.push_back(d_B_values + prob.offset_B + b * B_batch_stride);
-            large.ptr_C.push_back(output_base + pair_output_offset + b * C_batch_stride);
-
-            large.lda.push_back(prob.lda);
-            large.ldb.push_back(prob.ldb);
-            large.ldc.push_back(prob.ldc);
-            large.ldd.push_back(prob.ldc);  // ldd same as ldc for output
+            queue.ptr_A.push_back(d_A_values + prob.offset_A + b * A_batch_stride);
+            queue.ptr_B.push_back(d_B_values + prob.offset_B + b * B_batch_stride);
+            queue.ptr_C.push_back(output_base + pair_output_offset + b * C_batch_stride);
         }
     }
 }
@@ -352,32 +329,8 @@ void print_tier_diagnostic(
 // Shape classification for CUTLASS-tier problems
 // ============================================================================
 
-enum class ShapeQueue { Square, SkinnyTall, SkinnyWide, Square32 };
-constexpr int NUM_SHAPE_QUEUES = 4;
-
-inline const char* shape_queue_name(ShapeQueue q) {
-    switch (q) {
-        case ShapeQueue::Square:     return "Square";
-        case ShapeQueue::SkinnyTall: return "SkinnyTall";
-        case ShapeQueue::SkinnyWide: return "SkinnyWide";
-        case ShapeQueue::Square32:   return "Square32";
-    }
-    return "?";
-}
-
-// Classify a CUTLASS-tier problem by its M/N shape.
-// Precondition: M >= MIN_CUTLASS_DIM && N >= MIN_CUTLASS_DIM.
-// Square32: min_dim >= 16 && max_dim <= 32 (32x32 tile has strictly less padding)
-// Square:   min_dim >= 16 && max_dim > 32 (64x64+ tiles)
-// Skinny:   min_dim < 16, split tall/wide by M > N
-inline ShapeQueue classify_shape(dim_t M, dim_t N) {
-    dim_t min_dim = std::min(M, N);
-    if (min_dim >= 16) {
-        dim_t max_dim = std::max(M, N);
-        return (max_dim <= 32) ? ShapeQueue::Square32 : ShapeQueue::Square;
-    }
-    return (M > N) ? ShapeQueue::SkinnyTall : ShapeQueue::SkinnyWide;
-}
+// ShapeQueue / NUM_SHAPE_QUEUES / classify_shape now live in
+// kernels/large/shape_queue.hpp, shared with the efficiency tables.
 
 // Per-queue work for shape-classified CUTLASS dispatch.
 template <typename T>
@@ -452,30 +405,158 @@ inline TileShape score_tile_candidates(
     return best;
 }
 
+// Best-scoring CUTLASS tile plus the score it achieved, so the cuBLAS
+// candidate can be ranked against it on the same scale.
+inline float score_of_tile(const TileCandidate* cands, int n_cands,
+                           const std::vector<GemmProblemDesc>& problems,
+                           TileShape tile)
+{
+    for (int ci = 0; ci < n_cands; ++ci) {
+        if (cands[ci].tile != tile) continue;
+        const auto& c = cands[ci];
+        int64_t total_useful = 0, total_padded = 0;
+        for (const auto& prob : problems) {
+            int64_t padM = static_cast<int64_t>((prob.M + c.Tm - 1) / c.Tm) * c.Tm;
+            int64_t padN = static_cast<int64_t>((prob.N + c.Tn - 1) / c.Tn) * c.Tn;
+            total_useful += static_cast<int64_t>(prob.M) * prob.N * prob.K * prob.batch_size;
+            total_padded += padM * padN * prob.K * prob.batch_size;
+        }
+        float util = total_padded > 0 ? float(total_useful) / float(total_padded) : 0.0f;
+        return c.eff * util;
+    }
+    return 0.0f;
+}
+
+// cuBLAS score.  Two terms, because cuBLAS's cost has two parts:
+//
+//   throughput -- utilization is 1 by construction (no user-visible tile to pad
+//                 against), so the throughput term is eta alone, FLOP-weighted
+//                 across the size bins present in the queue;
+//   per group  -- a fixed cost charged once per cuBLAS group (one group per
+//                 GemmProblemDesc), which is what makes cuBLAS collapse on
+//                 queues of many tiny blocks even though its per-FLOP rate on
+//                 those shapes looks merely mediocre.
+//
+// Combining them as times and renormalising back to the "fraction of 128x128
+// peak" scale the tile scores live on:
+//
+//   score = flops / (flops/eta + n_groups * c) = 1 / (1/eta + n_groups*c/flops)
+//
+inline float score_cublas_candidate(const CublasCandidate& cand,
+                                    const std::vector<GemmProblemDesc>& problems)
+{
+    if (!cand.calibrated) return -1.0f;
+    double weighted = 0.0, total = 0.0;
+    for (const auto& prob : problems) {
+        const double flops = static_cast<double>(prob.M) * prob.N *
+                             prob.K * prob.batch_size;
+        weighted += flops * static_cast<double>(cand.eff[cublas_size_bin(prob.M, prob.N)]);
+        total += flops;
+    }
+    if (total <= 0.0) return -1.0f;
+    const double eta = weighted / total;
+    if (eta <= 0.0) return -1.0f;
+    const double overhead = static_cast<double>(problems.size()) *
+                            static_cast<double>(cand.group_cost_flops) / total;
+    return static_cast<float>(1.0 / (1.0 / eta + overhead));
+}
+
+// Backend forced by BSPTC_LARGE_BACKEND=cutlass|cublas|auto (default auto).
+// Exists so the two backends can be A/B'd on identical plans without rebuilding.
+enum class BackendOverride { Auto, ForceCutlass, ForceCublas };
+
+inline BackendOverride large_backend_override() {
+    static BackendOverride mode = [] {
+        const char* e = std::getenv("BSPTC_LARGE_BACKEND");
+        if (!e) return BackendOverride::Auto;
+        if (std::strcmp(e, "cublas") == 0)  return BackendOverride::ForceCublas;
+        if (std::strcmp(e, "cutlass") == 0) return BackendOverride::ForceCutlass;
+        return BackendOverride::Auto;
+    }();
+    return mode;
+}
+
+// Select the Large-tier kernel for a queue: the highest-scoring candidate
+// across both backends.  CUTLASS candidates score eff * utilization; the cuBLAS
+// candidate scores eta alone (see score_cublas_candidate).
+template <typename T>
+inline KernelChoice best_kernel_for_queue(const LargeBlockWork<T>& queue_work)
+{
+    if (queue_work.empty()) return KernelChoice(TileShape::Tile_128x128);
+
+    const int sm = get_sm_version_cached();
+    const TileCandidate* cands;
+    int n_cands;
+    TileShape fallback;
+    const CublasCandidate* cublas;
+
+    if constexpr (std::is_same_v<T, double>) {
+        if (sm >= 90) {
+            cands = f64_tc_sm9x; n_cands = f64_tc_sm9x_count;
+            fallback = TileShape::Tile_128x128; cublas = &cublas_f64_sm9x;
+        } else {
+            cands = f64_simt_sm8x; n_cands = f64_simt_sm8x_count;
+            fallback = TileShape::Tile_64x64; cublas = &cublas_f64_sm8x;
+        }
+    } else {
+        if (sm >= 90) {
+            cands = f32_sm9x; n_cands = f32_sm9x_count;
+            fallback = TileShape::Tile_128x128; cublas = &cublas_f32_sm9x;
+        } else {
+            cands = f32_sm8x; n_cands = f32_sm8x_count;
+            fallback = TileShape::Tile_128x128; cublas = &cublas_f32_sm8x;
+        }
+    }
+
+    const TileShape best_tile =
+        score_tile_candidates(cands, n_cands, queue_work.problems, fallback);
+
+    switch (large_backend_override()) {
+        case BackendOverride::ForceCutlass:
+            return KernelChoice(LargeBackend::CUTLASS, best_tile);
+        case BackendOverride::ForceCublas:
+            return KernelChoice(LargeBackend::CUBLAS, best_tile);
+        case BackendOverride::Auto:
+            break;
+    }
+
+    const float tile_score =
+        score_of_tile(cands, n_cands, queue_work.problems, best_tile);
+    const float cublas_score = score_cublas_candidate(*cublas, queue_work.problems);
+
+    if (std::getenv("BSPTC_DUMP_KERNEL_CHOICE")) {
+        double wf = 0, tot = 0, wmin = 0;
+        int64_t nexp = 0;
+        for (const auto& p : queue_work.problems) {
+            double f = double(p.M) * p.N * p.K * p.batch_size;
+            tot += f; wmin += f * std::min(p.M, p.N); wf += f / std::max<int64_t>(p.batch_size,1);
+            nexp += p.batch_size;
+        }
+        std::fprintf(stderr,
+            "[choice] groups=%zu expanded=%lld flops=%.3gG wmean_min(M,N)=%.1f "
+            "flops/prob=%.3gM | tile=%s score=%.3f | cublas score=%.3f -> %s\n",
+            queue_work.problems.size(), (long long)nexp, tot / 1e9,
+            tot > 0 ? wmin / tot : 0.0, tot / std::max<size_t>(queue_work.problems.size(),1) / 1e6,
+            tile_shape_name(best_tile), double(tile_score), double(cublas_score),
+            cublas_score > tile_score ? "CUBLAS" : "CUTLASS");
+    }
+
+    if (cublas_score > tile_score)
+        return KernelChoice(LargeBackend::CUBLAS, best_tile);
+    return KernelChoice(LargeBackend::CUTLASS, best_tile);
+}
+
+// Backwards-compatible tile-only selector (used by the tile calibration bench).
 template <typename T>
 inline TileShape best_tile_for_queue(const LargeBlockWork<T>& queue_work)
 {
-    if (queue_work.empty()) return TileShape::Tile_128x128;
-
-    int sm = get_sm_version_cached();
-
-    if constexpr (std::is_same_v<T, double>) {
-        if (sm >= 90)
-            return score_tile_candidates(f64_tc_sm9x, f64_tc_sm9x_count, queue_work.problems, TileShape::Tile_128x128);
-        else
-            return score_tile_candidates(f64_simt_sm8x, f64_simt_sm8x_count, queue_work.problems, TileShape::Tile_64x64);
-    } else {
-        if (sm >= 90)
-            return score_tile_candidates(f32_sm9x, f32_sm9x_count, queue_work.problems, TileShape::Tile_128x128);
-        else
-            return score_tile_candidates(f32_sm8x, f32_sm8x_count, queue_work.problems, TileShape::Tile_128x128);
-    }
+    return best_kernel_for_queue(queue_work).tile;
 }
 
 // Split the large work from PartitionedWork into per-queue structures.
 // Distributes problems and aggregate counts by shape class.
-// Pointer arrays (ptr_A/B/C, lda/b/c/d) are NOT copied here — call
-// distribute_large_pointers after build_large_pointers to fill them.
+// Pointer arrays (ptr_A/B/C) are NOT filled here — call bind_queue_pointers
+// per queue once the output/temp buffers exist.
 template <typename T>
 ShapeClassifiedWork<T> classify_cutlass_work(const PartitionedWork<T>& work) {
     ShapeClassifiedWork<T> classified;
@@ -487,59 +568,12 @@ ShapeClassifiedWork<T> classify_cutlass_work(const PartitionedWork<T>& work) {
         auto& queue = classified[q];
 
         queue.problems.push_back(prob);
-        queue.source_indices.push_back(j);
         int64_t output_vol = static_cast<int64_t>(prob.M) * prob.N * prob.batch_size;
         queue.total_output_elements += output_vol;
         queue.num_gemm_problems += prob.batch_size;
     }
 
     return classified;
-}
-
-// Copy pointer arrays from the source large work into an already-classified
-// ShapeClassifiedWork. Must be called after build_large_pointers has populated
-// ptr_A/B/C and lda/b/c/d on the source.
-template <typename T>
-void distribute_large_pointers(ShapeClassifiedWork<T>& classified,
-                               const LargeBlockWork<T>& source)
-{
-    // Build problem-index-to-expanded-start mapping for source
-    std::vector<int64_t> expanded_start(source.problems.size());
-    int64_t idx = 0;
-    for (size_t j = 0; j < source.problems.size(); ++j) {
-        expanded_start[j] = idx;
-        idx += source.problems[j].batch_size;
-    }
-
-    for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
-        auto& queue = classified.queues[qi];
-        if (queue.empty()) continue;
-
-        queue.ptr_A.clear(); queue.ptr_B.clear(); queue.ptr_C.clear();
-        queue.lda.clear(); queue.ldb.clear(); queue.ldc.clear(); queue.ldd.clear();
-        queue.ptr_A.reserve(queue.num_gemm_problems);
-        queue.ptr_B.reserve(queue.num_gemm_problems);
-        queue.ptr_C.reserve(queue.num_gemm_problems);
-        queue.lda.reserve(queue.num_gemm_problems);
-        queue.ldb.reserve(queue.num_gemm_problems);
-        queue.ldc.reserve(queue.num_gemm_problems);
-        queue.ldd.reserve(queue.num_gemm_problems);
-
-        for (size_t i = 0; i < queue.problems.size(); ++i) {
-            const auto& prob = queue.problems[i];
-            size_t si = queue.source_indices[i];
-            int64_t es = expanded_start[si];
-            for (int64_t b = 0; b < prob.batch_size; ++b) {
-                queue.ptr_A.push_back(source.ptr_A[es + b]);
-                queue.ptr_B.push_back(source.ptr_B[es + b]);
-                queue.ptr_C.push_back(source.ptr_C[es + b]);
-                queue.lda.push_back(source.lda[es + b]);
-                queue.ldb.push_back(source.ldb[es + b]);
-                queue.ldc.push_back(source.ldc[es + b]);
-                queue.ldd.push_back(source.ldd[es + b]);
-            }
-        }
-    }
 }
 
 // Merge skinny queues into Square when their native-tile CTA count is small.
@@ -567,11 +601,9 @@ void merge_small_queues(ShapeClassifiedWork<T>& classified)
 
         if (total_ctas >= cta_threshold) continue;
 
-        // Merge into Square (problems only; pointers distributed later)
+        // Merge into Square (problems only; pointers bound later)
         auto& dst = classified[ShapeQueue::Square];
         dst.problems.insert(dst.problems.end(), src.problems.begin(), src.problems.end());
-        dst.source_indices.insert(dst.source_indices.end(),
-            src.source_indices.begin(), src.source_indices.end());
         dst.total_output_elements += src.total_output_elements;
         dst.num_gemm_problems += src.num_gemm_problems;
 

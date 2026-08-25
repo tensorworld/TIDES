@@ -20,6 +20,8 @@
 
 #include "general_sparse/kernels/large/cutlass_grouped_fwd.hpp"
 #include "general_sparse/kernels/large/cutlass_tile_shapes.hpp"
+#include "general_sparse/kernels/large/cublas_grouped_fwd.hpp"
+#include "general_sparse/kernels/large/shape_queue.hpp"
 #include "general_sparse/pipeline_descs.hpp"
 #include "general_sparse/gpu_sparse_device.cuh"
 
@@ -98,10 +100,6 @@ SyntheticSetup<T> build_synthetic(int M, int N, int K, int num_problems) {
     s.work.ptr_A.resize(num_problems);
     s.work.ptr_B.resize(num_problems);
     s.work.ptr_C.resize(num_problems);
-    s.work.lda.resize(num_problems);
-    s.work.ldb.resize(num_problems);
-    s.work.ldc.resize(num_problems);
-    s.work.ldd.resize(num_problems);
     s.work.num_gemm_problems = num_problems;
     s.work.total_output_elements = total_C;
 
@@ -120,10 +118,6 @@ SyntheticSetup<T> build_synthetic(int M, int N, int K, int num_problems) {
         s.work.ptr_A[i] = s.d_A + i * A_elems;
         s.work.ptr_B[i] = s.d_B + i * B_elems;
         s.work.ptr_C[i] = s.d_C + i * C_elems;
-        s.work.lda[i] = K;
-        s.work.ldb[i] = N;
-        s.work.ldc[i] = N;
-        s.work.ldd[i] = N;
     }
 
     s.total_flops = 2LL * M * N * K * num_problems;
@@ -150,7 +144,7 @@ TileResult bench_tile(TileShape tile, int M, int N, int K,
 
     // Prepare CUTLASS grouped GEMM
     T alpha = T(1), beta = T(0);
-    auto runner = prepare_cutlass_gemm_dispatch<T>(
+    auto runner = prepare_cutlass_tile_dispatch<T>(
         setup.work, alpha, beta, tile, stream);
 
     if (!runner) {
@@ -168,6 +162,34 @@ TileResult bench_tile(TileShape tile, int M, int N, int K,
     setup.free();
 
     return {tile, M, N, K, num_problems, result.median_ms, gflops};
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark the cuBLAS grouped-GEMM candidate at one (M, N, K) config
+// ---------------------------------------------------------------------------
+// cuBLAS picks its own tile, so there is nothing to sweep here: one number per
+// shape, which is exactly what the shape-binned eta needs.
+
+template <typename T>
+TileResult bench_cublas(int M, int N, int K, int num_problems,
+                        int warmup, int repeat, cudaStream_t stream)
+{
+    auto setup = build_synthetic<T>(M, N, K, num_problems);
+
+    T alpha = T(1), beta = T(0);
+    auto runner = prepare_cublas_gemm<T>(setup.work, alpha, beta, stream);
+    if (!runner) {
+        setup.free();
+        return {TileShape::Tile_128x128, M, N, K, num_problems, -1.0f, 0.0};
+    }
+    cudaStreamSynchronize(stream);
+
+    auto result = gpu_bench([&]() { runner.run(stream); }, warmup, repeat, stream);
+    double gflops = static_cast<double>(setup.total_flops) / (result.median_ms * 1e6);
+
+    runner.free_buffers();
+    setup.free();
+    return {TileShape::Tile_128x128, M, N, K, num_problems, result.median_ms, gflops};
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +336,224 @@ void run_sweep(int num_problems, int warmup, int repeat, cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
+// cuBLAS calibration mode: eta per shape class
+// ---------------------------------------------------------------------------
+// Measures the cuBLAS grouped-GEMM candidate against the best CUTLASS tile on
+// the same shape sweep, and emits a paste-ready CublasCandidate initializer.
+//
+// Normalisation matches the tile table: everything is divided by the 128x128
+// tile's peak GFLOP/s across the sweep.  Because the cuBLAS candidate carries no
+// utilization term, its eta must be the efficiency actually ACHIEVED on each
+// shape class (not a peak-over-all-shapes figure like the tile coefficients),
+// so per-class values are FLOP-weighted means over the shapes in that class.
+
+// Does cuBLAS use FP64 tensor cores (DMMA) in the grouped path?
+//
+// An FFMA (non-TC) f64 kernel cannot exceed the vector FP64 ceiling no matter
+// how compute-bound you make it; a DMMA kernel can go roughly 2x past it.  So
+// hold M/N large and square and sweep K upward: whatever a kernel converges to
+// at large K is its real ceiling.  Compare both backends against the two
+// hardware peaks and the question answers itself.
+template <typename T>
+void run_cublas_k_sweep(int num_problems, int warmup, int repeat,
+                        cudaStream_t stream)
+{
+    const char* dtype_name = std::is_same<T, double>::value ? "f64" : "f32";
+    printf("\n=== cuBLAS vs CUTLASS as K grows (%s) ===\n", dtype_name);
+    printf("M=N=512, num_problems=%d\n", num_problems);
+    printf("A non-tensor-core f64 kernel cannot pass the vector FP64 peak.\n\n");
+
+    const int Ks[] = {128, 256, 512, 1024, 2048, 4096};
+    printf("%8s %14s %14s %12s %10s\n",
+           "K", "cuBLAS GF/s", "bestTile GF/s", "best tile", "ratio");
+    for (int i = 0; i < 62; ++i) printf("-");
+    printf("\n");
+
+    for (size_t ki = 0; ki < sizeof(Ks) / sizeof(Ks[0]); ++ki) {
+        const int K = Ks[ki];
+        const int np = num_problems;
+        auto cb = bench_cublas<T>(512, 512, K, np, warmup, repeat, stream);
+
+        double best_gf = 0; const char* best_name = "-";
+        for (int t = 0; t < NUM_TILES; ++t) {
+            auto r = bench_tile<T>(ALL_TILES[t], 512, 512, K, np,
+                                   warmup, repeat, stream);
+            if (r.gflops > best_gf) { best_gf = r.gflops; best_name = tile_shape_name(ALL_TILES[t]); }
+        }
+        printf("%8d %14.1f %14.1f %12s %9.2fx\n",
+               K, cb.gflops, best_gf, best_name,
+               best_gf > 0 ? cb.gflops / best_gf : 0.0);
+    }
+}
+
+template <typename T>
+void run_cublas_calibration(int num_problems, int warmup, int repeat,
+                            cudaStream_t stream)
+{
+    const ShapeConfig shapes[] = {
+        {128, 128, 128, "128x128x128"}, {256, 256, 128, "256x256x128"},
+        {512, 512, 128, "512x512x128"}, {64,  64,  128, "64x64x128"},
+        {32,  32,  128, "32x32x128"},
+        {96,  96,  128, "96x96x128"},   {192, 192, 128, "192x192x128"},
+        {384, 384, 128, "384x384x128"}, {768, 768, 128, "768x768x128"},
+        {256, 128, 128, "256x128x128"}, {128, 256, 128, "128x256x128"},
+        {512, 256, 128, "512x256x128"}, {256, 512, 128, "256x512x128"},
+        {96,  192, 128, "96x192x128"},  {192, 96,  128, "192x96x128"},
+        {256,  8,  128, "256x8x128"},   {512,  8,  128, "512x8x128"},
+        {128, 16,  128, "128x16x128"},  {256, 16,  128, "256x16x128"},
+        {256, 32,  128, "256x32x128"},  {512, 32,  128, "512x32x128"},
+        {1024, 8,  128, "1024x8x128"},  {1024, 16, 128, "1024x16x128"},
+        {1024, 32, 128, "1024x32x128"},
+        {8,  256,  128, "8x256x128"},   {8,  512,  128, "8x512x128"},
+        {16, 128,  128, "16x128x128"},  {16, 256,  128, "16x256x128"},
+        {32, 256,  128, "32x256x128"},  {32, 512,  128, "32x512x128"},
+        {8,  1024, 128, "8x1024x128"},  {16, 1024, 128, "16x1024x128"},
+        {32, 1024, 128, "32x1024x128"},
+        {128, 32,  128, "128x32x128"},  {64,  16,  128, "64x16x128"},
+        {32,  128, 128, "32x128x128"},  {16,  64,  128, "16x64x128"},
+        {128, 128, 256, "128x128x256"}, {256,  32, 256, "256x32x256"},
+        {32,  256, 256, "32x256x256"},  {128,  16, 256, "128x16x256"},
+        {16,  128, 256, "16x128x256"},  {64,   8,  256, "64x8x256"},
+        {8,   64,  256, "8x64x256"},
+    };
+    const int num_shapes = sizeof(shapes) / sizeof(shapes[0]);
+
+    const char* dtype_name = std::is_same<T, double>::value ? "f64" : "f32";
+    printf("\n=== cuBLAS grouped GEMM vs CUTLASS tiles (%s) ===\n", dtype_name);
+    printf("num_problems=%d, warmup=%d, repeat=%d\n\n", num_problems, warmup, repeat);
+
+    printf("%-16s %-11s %12s %12s %11s %8s\n",
+           "Shape (MxNxK)", "size bin", "cuBLAS GF/s", "bestTile GF/s", "best tile", "ratio");
+    for (int i = 0; i < 76; ++i) printf("-");
+    printf("\n");
+
+    double peak_128 = 0.0;
+    double class_flops[NUM_CUBLAS_SIZE_BINS] = {};
+    double class_cublas_time[NUM_CUBLAS_SIZE_BINS] = {};
+    int    class_count[NUM_CUBLAS_SIZE_BINS] = {};
+    int    wins = 0, measured = 0;
+
+    for (int si = 0; si < num_shapes; ++si) {
+        const auto& sh = shapes[si];
+
+        double best_tile_gf = 0.0;
+        int best_tile_idx = 0;
+        for (int t = 0; t < NUM_TILES; ++t) {
+            auto r = bench_tile<T>(ALL_TILES[t], sh.M, sh.N, sh.K,
+                                   num_problems, warmup, repeat, stream);
+            if (r.gflops > best_tile_gf) { best_tile_gf = r.gflops; best_tile_idx = t; }
+            if (ALL_TILES[t] == TileShape::Tile_128x128 && r.gflops > peak_128)
+                peak_128 = r.gflops;
+        }
+
+        auto cb = bench_cublas<T>(sh.M, sh.N, sh.K, num_problems,
+                                  warmup, repeat, stream);
+
+        const int bin = cublas_size_bin(sh.M, sh.N);
+        const double flops = 2.0 * sh.M * sh.N * sh.K * num_problems;
+        if (cb.gflops > 0) {
+            // Accumulate time, not GFLOP/s: a FLOP-weighted mean efficiency is
+            // total_flops / total_time, which averaging rates would misstate.
+            class_flops[bin] += flops;
+            class_cublas_time[bin] += flops / (cb.gflops * 1e9);
+            ++class_count[bin];
+            ++measured;
+            if (cb.gflops > best_tile_gf) ++wins;
+        }
+
+        printf("%-16s %-11s %12.1f %12.1f %11s %8s",
+               sh.label, cublas_size_bin_name(bin),
+               cb.gflops, best_tile_gf, tile_shape_name(ALL_TILES[best_tile_idx]),
+               "");
+        if (cb.gflops > 0 && best_tile_gf > 0)
+            printf("%6.2fx\n", cb.gflops / best_tile_gf);
+        else
+            printf("%7s\n", "FAIL");
+    }
+
+    printf("\ncuBLAS beat the best CUTLASS tile on %d/%d shapes\n", wins, measured);
+    printf("128x128 peak = %.1f GFLOP/s (normalisation basis)\n", peak_128);
+
+    printf("\n=== eta per size bin (paste into tile_efficiency.hpp) ===\n");
+    printf("// order: {min<16, 16-63, 64-127, 128-255, >=256}\n");
+    printf("    {");
+    for (int b = 0; b < NUM_CUBLAS_SIZE_BINS; ++b) {
+        double eta = 0.0;
+        if (class_cublas_time[b] > 0 && peak_128 > 0)
+            eta = (class_flops[b] / class_cublas_time[b] / 1e9) / peak_128;
+        printf("%.2ff%s", eta, (b + 1 < NUM_CUBLAS_SIZE_BINS) ? ", " : "");
+    }
+    printf("}, true\n");
+    for (int b = 0; b < NUM_CUBLAS_SIZE_BINS; ++b) {
+        double gf = class_cublas_time[b] > 0
+                  ? class_flops[b] / class_cublas_time[b] / 1e9 : 0.0;
+        printf("//   %-9s %2d shapes, cuBLAS %8.1f GF/s\n",
+               cublas_size_bin_name(b), class_count[b], gf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cuBLAS per-group overhead
+// ---------------------------------------------------------------------------
+// cuBLAS grouped GEMM pays a fixed cost per group that a pure efficiency
+// coefficient cannot express: two queues with identical shapes and identical
+// total FLOPs behave very differently at 2 groups vs 2000.  This mode isolates
+// that cost by holding the per-group shape tiny (so the throughput term is
+// negligible) and sweeping the group count, then reports the cost in
+// "FLOPs of peak throughput per group", which is the unit the selector needs.
+
+template <typename T>
+void run_cublas_group_sweep(int warmup, int repeat, cudaStream_t stream,
+                            double peak_gflops)
+{
+    const char* dtype_name = std::is_same<T, double>::value ? "f64" : "f32";
+    printf("\n=== cuBLAS per-group overhead (%s) ===\n", dtype_name);
+    printf("peak (128x128) = %.1f GFLOP/s\n\n", peak_gflops);
+
+    const ShapeConfig shapes[] = {
+        {8,   8,  32, "8x8x32"},
+        {16,  16, 32, "16x16x32"},
+        {32,  32, 32, "32x32x32"},
+    };
+    const int counts[] = {64, 256, 1024, 4096};
+    const int nc = sizeof(counts) / sizeof(counts[0]);
+
+    printf("%-12s %8s %12s %12s %14s\n",
+           "shape", "groups", "time (ms)", "GFLOP", "c_norm (MFLOP)");
+    for (int i = 0; i < 62; ++i) printf("-");
+    printf("\n");
+
+    double c_sum = 0.0;
+    int c_n = 0;
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); ++si) {
+        const auto& sh = shapes[si];
+        for (int ci = 0; ci < nc; ++ci) {
+            const int g = counts[ci];
+            auto r = bench_cublas<T>(sh.M, sh.N, sh.K, g, warmup, repeat, stream);
+            if (r.median_ms <= 0) continue;
+            const double flops = 2.0 * sh.M * sh.N * sh.K * g;
+            // Time attributable to per-group overhead = total minus the time the
+            // same FLOPs would take at peak throughput.
+            const double ideal_s = flops / (peak_gflops * 1e9);
+            const double over_s = r.median_ms * 1e-3 - ideal_s;
+            // Express one group's overhead as the FLOP count that would take the
+            // same time at peak: this is the unit the score model uses.
+            const double c_norm = over_s > 0
+                ? over_s / g * peak_gflops * 1e9 : 0.0;
+            printf("%-12s %8d %12.3f %12.4f %14.2f\n",
+                   sh.label, g, r.median_ms, flops / 1e9, c_norm / 1e6);
+            if (c_norm > 0) { c_sum += c_norm; ++c_n; }
+        }
+    }
+    if (c_n > 0) {
+        printf("\nmean per-group cost c_norm = %.2f MFLOP-equivalent\n",
+               c_sum / c_n / 1e6);
+        printf("paste into the CublasCandidate as group_cost_flops = %.0fe6f\n",
+               c_sum / c_n / 1e6);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Default mode: one aligned problem shape, all tiles, sweep batch counts
 // ---------------------------------------------------------------------------
 
@@ -431,6 +671,10 @@ int main(int argc, char** argv) {
     int M = 1024, N = 1024, K = 128;
     bool sweep = false;
     bool count_sweep = false;
+    bool cublas_mode = false;
+    bool cublas_groups = false;
+    bool cublas_ksweep = false;
+    double peak_gflops = 0.0;
     bool use_f64 = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -458,6 +702,10 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--sweep") == 0) sweep = true;
         else if (strcmp(argv[i], "--count-sweep") == 0) count_sweep = true;
+        else if (strcmp(argv[i], "--cublas") == 0) cublas_mode = true;
+        else if (strcmp(argv[i], "--cublas-groups") == 0) cublas_groups = true;
+        else if (strcmp(argv[i], "--cublas-ksweep") == 0) cublas_ksweep = true;
+        else if (strcmp(argv[i], "--peak") == 0 && i + 1 < argc) peak_gflops = atof(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [options]\n\n", argv[0]);
             printf("Default: all tiles on one aligned shape, sweep batch counts\n");
@@ -469,6 +717,9 @@ int main(int argc, char** argv) {
             printf("\nModes:\n");
             printf("  --sweep           M/N sweep across all tiles\n");
             printf("  --count-sweep     Batch-count sweep on multiple shapes\n");
+            printf("  --cublas          Calibrate the cuBLAS candidate's eta per size bin\n");
+            printf("  --cublas-groups   Measure cuBLAS per-group overhead (needs --peak GF/s)\n");
+            printf("  --peak GF/s       128x128 peak for --cublas-groups normalisation\n");
             return 0;
         }
     }
@@ -483,7 +734,16 @@ int main(int argc, char** argv) {
     cudaStreamCreate(&stream);
 
     if (use_f64) {
-        if (count_sweep) {
+        if (cublas_ksweep) {
+            run_cublas_k_sweep<double>(num_problems > 0 ? num_problems : 128,
+                                     warmup, repeat, stream);
+        } else if (cublas_groups) {
+            run_cublas_group_sweep<double>(warmup, repeat, stream,
+                                           peak_gflops > 0 ? peak_gflops : 417.0);
+        } else if (cublas_mode) {
+            run_cublas_calibration<double>(num_problems > 0 ? num_problems : 512,
+                                           warmup, repeat, stream);
+        } else if (count_sweep) {
             run_count_sweep<double>(warmup, repeat, stream);
         } else if (sweep) {
             int np = num_problems > 0 ? num_problems : 512;
@@ -493,7 +753,16 @@ int main(int argc, char** argv) {
                         warmup, repeat, stream);
         }
     } else {
-        if (count_sweep) {
+        if (cublas_ksweep) {
+            run_cublas_k_sweep<float>(num_problems > 0 ? num_problems : 128,
+                                     warmup, repeat, stream);
+        } else if (cublas_groups) {
+            run_cublas_group_sweep<float>(warmup, repeat, stream,
+                                          peak_gflops > 0 ? peak_gflops : 11399.5);
+        } else if (cublas_mode) {
+            run_cublas_calibration<float>(num_problems > 0 ? num_problems : 512,
+                                          warmup, repeat, stream);
+        } else if (count_sweep) {
             run_count_sweep<float>(warmup, repeat, stream);
         } else if (sweep) {
             int np = num_problems > 0 ? num_problems : 512;

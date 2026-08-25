@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -110,8 +109,8 @@ struct TensorCase {
 
 std::vector<TensorCase> discover_cases(const std::string& filter) {
     std::vector<TensorCase> cases;
-    const char* env = std::getenv("TIDES_TENSOR_DIR");
-    std::string base_dir = env ? env : "../generated_tensors/cutensor_converted";
+    std::string base_dir = std::string(getenv("HOME")) +
+        "/data/block_sparse_dev/generated_tensors/cutensor_converted";
 
     for (auto& entry : fs::directory_iterator(base_dir)) {
         if (!entry.is_directory()) continue;

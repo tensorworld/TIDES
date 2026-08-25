@@ -21,8 +21,10 @@ GeneralSparseResult<T> execute_general_sparse_pipeline(
     PipelineTimingBreakdown* timing = nullptr)
 {
     PipelinePlan<T> plan;
-    pipeline_setup<T>(plan, A_gpu, B_gpu, A_dev, B_dev,
-                      index_sets, output_labels, dispatch_config, timing);
+    if (!pipeline_setup<T>(plan, A_gpu, B_gpu, A_dev, B_dev,
+                           index_sets, output_labels, dispatch_config, timing))
+        throw std::runtime_error(
+            "execute_general_sparse_pipeline: pipeline_setup failed (see stderr)");
 
     pipeline_execute<T>(plan, A_gpu, B_gpu, A_dev, B_dev);
 

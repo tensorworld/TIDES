@@ -219,6 +219,170 @@ inline const char* BATCH_NONLEAD_B = R"(
 1, 1, 1
 )";
 
+// Batch not leading in B: einsum bij,jbk->bik
+// A modes "bij": b=batch(pos0), i=free(pos1), j=contracted(pos2) → OK
+// B modes "jbk": j=contracted(pos0), b=batch(pos1), k=free(pos2) → interleaved
+inline const char* BATCH_NONLEAD_B_SIDE_A = R"(
+# Tensor A (bij) - batch leading
+{2, 2, 2}
+2
+{2, 2, 3, 3, 4, 4}
+0, 0, 0
+1, 1, 1
+)";
+
+inline const char* BATCH_NONLEAD_B_SIDE_B = R"(
+# Tensor B (jbk) - contracted/batch/free interleaved
+{2, 2, 2}
+2
+{4, 4, 2, 2, 3, 3}
+0, 0, 0
+1, 1, 1
+)";
+
+// Reversed two-batch prefix: einsum abij,bajk->abik
+// Batch labels lead in BOTH operands, but in different orders (ab vs ba);
+// the batch-leftmost invariant requires identical canonical order, so the
+// pipeline must reject. This is the shape the fuzzer hit at seed 120.
+inline const char* BATCH_PREFIX_REVERSED_A = R"(
+# Tensor A (abij) - batch prefix a,b
+{2, 2, 2, 2}
+2
+{2, 2, 2, 2, 3, 3, 4, 4}
+0, 0, 0, 0
+1, 1, 1, 1
+)";
+
+inline const char* BATCH_PREFIX_REVERSED_B = R"(
+# Tensor B (bajk) - batch prefix b,a (reversed)
+{2, 2, 2, 2}
+2
+{2, 2, 2, 2, 4, 4, 3, 3}
+0, 0, 0, 0
+1, 1, 1, 1
+)";
+
+// --- Squashed-rank overflow tensors -----------------------------------------
+// K-reversal shapes (muvwxy,yxwvun->mn): the 5 contracted dims u..y are
+// contiguous in BOTH operands but in reversed order in B, so the dual squash
+// (which needs both stride sets contiguous) keeps all 5 groups — exceeding
+// WARP_MAX_DIMS=4 — and B's combined K+free volume rank is 6 > VOL_MAX_RANK=5.
+// The partitioner's rank-eligibility check must reroute these to CUTLASS
+// (whose B transpose squashes to 6 groups, well within HT_MAX_RANK). Before
+// that check existed, the warp/volume desc builders overflowed fixed-capacity
+// stack arrays.
+inline const char* RANK_OVERFLOW_KREV_A_WARP = R"(
+# Tensor A (muvwxy) - free m=2, contracted u..y contiguous, rank 6
+{1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0
+)";
+
+inline const char* RANK_OVERFLOW_KREV_B_WARP = R"(
+# Tensor B (yxwvun) - contracted reversed vs A, free n=2, rank 6
+{1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0
+)";
+
+// Volume variant: m=n=4 → min(M,N)=4 skips the warp tier; volume by magnitude
+// (M*K+N*K = 256), vetoed by rank (B combined 5+1 = 6 > VOL_MAX_RANK).
+inline const char* RANK_OVERFLOW_KREV_A_VOL = R"(
+# Tensor A (muvwxy) - free m=4, contracted u..y contiguous, rank 6
+{1, 1, 1, 1, 1, 1}
+1
+{4, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0
+)";
+
+inline const char* RANK_OVERFLOW_KREV_B_VOL = R"(
+# Tensor B (yxwvun) - contracted reversed vs A, free n=4, rank 6
+{1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 4}
+0, 0, 0, 0, 0, 0
+)";
+
+// Fully-alternating shapes (aubvcwdxey): 5 free dims interleaved with 5
+// contracted dims — squashed free AND K rank are both 5. Warp/volume can't
+// hold them, AND the CUTLASS transpose would need 10 non-mergeable groups
+// (> HT_MAX_RANK=8), so the pipeline cannot execute this contraction at all.
+// Setup must fail loudly (it used to corrupt stack arrays instead).
+inline const char* RANK_OVERFLOW_A = R"(
+# Tensor A (aubvcwdxey) - free/contracted alternating, rank 10, all dims 2
+{1, 1, 1, 1, 1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+)";
+
+inline const char* RANK_OVERFLOW_B_WARP = R"(
+# Tensor B (uvwxyz) - 5 contracted + 1 free, rank 6, all dims 2
+{1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0
+)";
+
+inline const char* RANK_OVERFLOW_B_VOL = R"(
+# Tensor B (uvwxyzt) - 5 contracted + 2 free, rank 7, all dims 2
+{1, 1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0, 0
+)";
+
+// Output rank overflow: acegik,bdfhjk->abcdefghij has a rank-10 output —
+// beyond MAX_RANK=8, which bounds ContractionConfig::internal_to_output and
+// every downstream output-coord array. build_contraction_config must flag it
+// and pipeline_plan reject it loudly (previously the i2o array overflowed
+// into output_rank and the stack — silent memory corruption).
+inline const char* OUT_PERM_OVERFLOW_A = R"(
+# Tensor A (acegik) - 5 free + contracted k, rank 6, all dims 2
+{1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0
+)";
+
+inline const char* OUT_PERM_OVERFLOW_B = R"(
+# Tensor B (bdfhjk) - 5 free + contracted k, rank 6, all dims 2
+{1, 1, 1, 1, 1, 1}
+1
+{2, 2, 2, 2, 2, 2}
+0, 0, 0, 0, 0, 0
+)";
+
+// All-trivial output permute: ij,jk->ki where every i-section has size 1.
+// Each output block is [i=1, k], so swapping to [k, i=1] moves no data —
+// the permute stage must short-circuit (buffer handed out as-is) while the
+// reported block coords are still permuted to output order.
+inline const char* TRIV_PERM_A = R"(
+# Tensor A (ij) - i sections all size 1
+{3, 2}
+6
+{1, 1, 1, 8, 12}
+0, 0
+0, 1
+1, 0
+1, 1
+2, 0
+2, 1
+)";
+
+inline const char* TRIV_PERM_B = R"(
+# Tensor B (jk) - j matches A's j sections
+{2, 2}
+4
+{8, 12, 6, 10}
+0, 0
+0, 1
+1, 0
+1, 1
+)";
+
 // Large-block interleaved layout tests: blocks large enough to go through CUTLASS (M*N >= 16384).
 // einsum: jik,jkl->il (A interleaved, B ok)
 // A modes "jik": j(pos0)=contracted, i(pos1)=free, k(pos2)=contracted → [C, F, C] interleaved

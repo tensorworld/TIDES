@@ -40,17 +40,23 @@ struct GemmProblemDesc {
     int64_t offset_A;       // Element offset into A values
     int64_t offset_B;       // Element offset into B values
     int64_t offset_C;       // Element offset into output buffer
+    // Unique (shape_A, shape_B) id from the shape-pair plan; lets the tier
+    // preps dedup with a dense array instead of hashing. Valid on descs
+    // produced by partition_by_threshold (derived/split descs may not
+    // maintain it).
+    uint32_t shape_pair_id;
 };
 
-// Collection of large block work for CUTLASS grouped GEMM
+// Collection of large block work for CUTLASS grouped GEMM.
+// Pointer arrays are batch-expanded (one entry per expanded problem), bound
+// per queue by bind_queue_pointers. Leading dimensions are NOT stored — the
+// CUTLASS arg-staging loop generates them from the descs (lda/ldb/ldc fields).
 template <typename T>
 struct LargeBlockWork {
     std::vector<GemmProblemDesc> problems;
-    std::vector<size_t> source_indices;  // parallel to problems: index into source large.problems
     std::vector<T*> ptr_A;
     std::vector<T*> ptr_B;
     std::vector<T*> ptr_C;
-    std::vector<int64_t> lda, ldb, ldc, ldd;
     int64_t total_output_elements = 0;
     int64_t num_gemm_problems = 0;
     GemmMode gemm_mode = GemmMode::NN;
@@ -75,7 +81,6 @@ struct PartitionedWork {
     LargeBlockWork<T> large;
     TierBlockWork medium;
     TierBlockWork small;
-    std::vector<BlockPairInfo> all_pairs;
 };
 
 // ============================================================================

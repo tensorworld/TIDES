@@ -37,17 +37,17 @@ void populate_timing_stats(
     t.medium_flops = sum_flops(plan.work.medium.problems);
     t.small_flops = sum_flops(plan.work.small.problems);
 
-    // Build large-tier tile info string (non-streaming: from nonstream_classified,
-    // streaming: already printed per-queue in streaming section below).
+    // Build large-tier tile info string (non-streaming: tiles already selected
+    // in pipeline_prepare — report them, don't re-score; streaming: reported
+    // per-queue in the streaming section below).
     if (!plan.streaming.enabled && !plan.work.large.empty()) {
         std::string info;
         for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
             const auto& qwork = plan.nonstream_classified.queues[qi];
             if (qwork.empty()) continue;
-            TileShape tile = best_tile_for_queue(qwork);
             if (!info.empty()) info += " ";
             info += std::string(shape_queue_name(static_cast<ShapeQueue>(qi)))
-                  + "=" + tile_shape_name(tile);
+                  + "=" + kernel_choice_name(plan.nonstream_kernels[qi]);
         }
         t.large_tile_info = std::move(info);
     }
@@ -62,6 +62,10 @@ void populate_timing_stats(
             transpose_bytes += B_dev.total_elements * static_cast<int64_t>(sizeof(T));
         transpose_bytes *= 2;  // read + write
     }
+    // Output permute: one read + write pass over the output
+    if (plan.output_permute_active())
+        transpose_bytes += 2 * plan.accum_map.total_output_elements
+                             * static_cast<int64_t>(sizeof(T));
     t.transpose_bytes = transpose_bytes;
 
     // Transpose dispatch kind strings
@@ -146,6 +150,8 @@ void populate_timing_stats(
         }
         peak += plan.total_pair_output_size * elem;
         peak += plan.accum_map.total_output_elements * elem;
+        if (plan.output_permute_active())  // internal accumulator + final buffer
+            peak += plan.accum_map.total_output_elements * elem;
         t.peak_gpu_bytes = peak;
     }
 
@@ -158,7 +164,7 @@ void populate_timing_stats(
             auto& qi_info = t.streaming_queues[qi];
             qi_info.batches = static_cast<int>(plan.streaming.queue_partitions[qi].batches.size());
             qi_info.problems = static_cast<int>(plan.streaming.queue_work[qi].problems.size());
-            qi_info.tile_name = tile_shape_name(plan.streaming.queue_tiles[qi]);
+            qi_info.tile_name = kernel_choice_name(plan.streaming.queue_kernels[qi]);
             total += qi_info.batches;
         }
         t.streaming_total_batches = total;

@@ -36,54 +36,50 @@ inline const char* gemm_mode_to_string(GemmMode mode) {
     return "NN";
 }
 
-inline bool check_group_order_A(const DimRole roles[MAX_RANK],
-                                const bool assigned[MAX_RANK],
-                                dim_t A_rank,
-                                bool transposed) {
-    // A normal group order: [Batch, Free, Contracted]
-    // A transposed group order: [Batch, Contracted, Free]
-    int max_group = -1;
-    for (int32_t p = 0; p < A_rank; ++p) {
-        if (!assigned[p]) continue;
-        int group = 0;
-        switch (roles[p]) {
-            case DimRole::Batch:
-                group = 0;
-                break;
-            case DimRole::Free:
-                group = transposed ? 2 : 1;
-                break;
-            case DimRole::Contracted:
-                group = transposed ? 1 : 2;
-                break;
-        }
-        if (group < max_group) return false;
-        max_group = group;
+// Role-parameterized view of one operand's dim-group positions. The two
+// operands differ only in which config arrays hold their positions and in
+// the "normal" group order: A-normal is [batch, free, contracted], B-normal
+// is [batch, contracted, free] — each role's normal is the other's
+// transposed, so a single implementation serves both.
+struct OperandDimGroups {
+    const int32_t* batch_pos;
+    const int32_t* free_pos;
+    const int32_t* contracted_pos;
+    int32_t num_batch;
+    int32_t num_free;
+    int32_t num_contracted;
+    dim_t rank;
+    bool free_first;  // true for A ([B,F,C] normal), false for B ([B,C,F] normal)
+};
+
+inline OperandDimGroups operand_dim_groups(const ContractionConfig& config,
+                                           dim_t rank, bool is_A) {
+    if (is_A) {
+        return {config.batch_pos_A, config.free_pos_A, config.contracted_pos_A,
+                config.num_batch, config.num_free_A, config.num_contracted,
+                rank, true};
     }
-    return true;
+    return {config.batch_pos_B, config.free_pos_B, config.contracted_pos_B,
+            config.num_batch, config.num_free_B, config.num_contracted,
+            rank, false};
 }
 
-inline bool check_group_order_B(const DimRole roles[MAX_RANK],
-                                const bool assigned[MAX_RANK],
-                                dim_t B_rank,
-                                bool transposed) {
-    // B normal group order: [Batch, Contracted, Free]
-    // B transposed group order: [Batch, Free, Contracted]
+// Check that the operand's dims appear grouped in the required order:
+// batch first, then free/contracted in the order given by free_first
+// (flipped when transposed).
+inline bool check_group_order(const OperandDimGroups& od,
+                              const DimRole roles[MAX_RANK],
+                              const bool assigned[MAX_RANK],
+                              bool transposed) {
+    const int free_group = (od.free_first != transposed) ? 1 : 2;
     int max_group = -1;
-    for (int32_t p = 0; p < B_rank; ++p) {
+    for (int32_t p = 0; p < od.rank; ++p) {
         if (!assigned[p]) continue;
         int group = 0;
-        switch (roles[p]) {
-            case DimRole::Batch:
-                group = 0;
-                break;
-            case DimRole::Contracted:
-                group = transposed ? 2 : 1;
-                break;
-            case DimRole::Free:
-                group = transposed ? 1 : 2;
-                break;
-        }
+        if (roles[p] == DimRole::Free)
+            group = free_group;
+        else if (roles[p] == DimRole::Contracted)
+            group = 3 - free_group;
         if (group < max_group) return false;
         max_group = group;
     }
@@ -98,76 +94,36 @@ inline bool positions_in_order(const int32_t* pos, int32_t count) {
     return true;
 }
 
-inline GemmOperandLayout classify_gemm_layout_A(const ContractionConfig& config, dim_t A_rank) {
+inline GemmOperandLayout classify_gemm_layout(const OperandDimGroups& od) {
     DimRole roles[MAX_RANK];
     bool assigned[MAX_RANK] = {};
 
-    for (int32_t i = 0; i < config.num_batch; ++i) {
-        int32_t pos = config.batch_pos_A[i];
-        roles[pos] = DimRole::Batch;
-        assigned[pos] = true;
+    for (int32_t i = 0; i < od.num_batch; ++i) {
+        roles[od.batch_pos[i]] = DimRole::Batch;
+        assigned[od.batch_pos[i]] = true;
     }
-    for (int32_t i = 0; i < config.num_free_A; ++i) {
-        int32_t pos = config.free_pos_A[i];
-        roles[pos] = DimRole::Free;
-        assigned[pos] = true;
+    for (int32_t i = 0; i < od.num_free; ++i) {
+        roles[od.free_pos[i]] = DimRole::Free;
+        assigned[od.free_pos[i]] = true;
     }
-    for (int32_t i = 0; i < config.num_contracted; ++i) {
-        int32_t pos = config.contracted_pos_A[i];
-        roles[pos] = DimRole::Contracted;
-        assigned[pos] = true;
+    for (int32_t i = 0; i < od.num_contracted; ++i) {
+        roles[od.contracted_pos[i]] = DimRole::Contracted;
+        assigned[od.contracted_pos[i]] = true;
     }
 
     // Batch dims must be in config-index order for linearized batch iteration
-    if (!positions_in_order(config.batch_pos_A, config.num_batch))
+    if (!positions_in_order(od.batch_pos, od.num_batch))
         return GemmOperandLayout::Interleaved;
 
     // Contracted dims must be in config-index order so flattened K matches
     // between operands (permutation functions produce config-index order)
-    if (!positions_in_order(config.contracted_pos_A, config.num_contracted))
+    if (!positions_in_order(od.contracted_pos, od.num_contracted))
         return GemmOperandLayout::Interleaved;
 
-    bool normal_ok = check_group_order_A(roles, assigned, A_rank, false);
-    bool transposed_ok = check_group_order_A(roles, assigned, A_rank, true);
-
-    if (normal_ok) return GemmOperandLayout::Normal;
-    if (transposed_ok) return GemmOperandLayout::Transposed;
-    return GemmOperandLayout::Interleaved;
-}
-
-inline GemmOperandLayout classify_gemm_layout_B(const ContractionConfig& config, dim_t B_rank) {
-    DimRole roles[MAX_RANK];
-    bool assigned[MAX_RANK] = {};
-
-    for (int32_t i = 0; i < config.num_batch; ++i) {
-        int32_t pos = config.batch_pos_B[i];
-        roles[pos] = DimRole::Batch;
-        assigned[pos] = true;
-    }
-    for (int32_t i = 0; i < config.num_contracted; ++i) {
-        int32_t pos = config.contracted_pos_B[i];
-        roles[pos] = DimRole::Contracted;
-        assigned[pos] = true;
-    }
-    for (int32_t i = 0; i < config.num_free_B; ++i) {
-        int32_t pos = config.free_pos_B[i];
-        roles[pos] = DimRole::Free;
-        assigned[pos] = true;
-    }
-
-    // Batch dims must be in config-index order for linearized batch iteration
-    if (!positions_in_order(config.batch_pos_B, config.num_batch))
-        return GemmOperandLayout::Interleaved;
-
-    // Contracted dims must be in config-index order so flattened K matches
-    if (!positions_in_order(config.contracted_pos_B, config.num_contracted))
-        return GemmOperandLayout::Interleaved;
-
-    bool normal_ok = check_group_order_B(roles, assigned, B_rank, false);
-    bool transposed_ok = check_group_order_B(roles, assigned, B_rank, true);
-
-    if (normal_ok) return GemmOperandLayout::Normal;
-    if (transposed_ok) return GemmOperandLayout::Transposed;
+    if (check_group_order(od, roles, assigned, false))
+        return GemmOperandLayout::Normal;
+    if (check_group_order(od, roles, assigned, true))
+        return GemmOperandLayout::Transposed;
     return GemmOperandLayout::Interleaved;
 }
 
@@ -221,113 +177,31 @@ inline dim_t count_unmoved_tail_dims(const std::vector<int32_t>& perm) {
     return tail;
 }
 
-// Check that A's mode positions follow the required [B..., F..., C...] order.
-// Returns true if compatible, false if interleaved.
-inline bool gemm_layout_compatible_A(const ContractionConfig& config, dim_t A_rank) {
-    return classify_gemm_layout_A(config, A_rank) == GemmOperandLayout::Normal;
-}
-
-// Check that B's mode positions follow the required [B..., C..., F...] order.
-// Returns true if compatible, false if interleaved.
-inline bool gemm_layout_compatible_B(const ContractionConfig& config, dim_t B_rank) {
-    return classify_gemm_layout_B(config, B_rank) == GemmOperandLayout::Normal;
-}
-
-// Validate that both operands have GEMM-compatible layouts.
-// Throws std::runtime_error if either operand has interleaved dimension groups.
-inline void validate_gemm_layout(const ContractionConfig& config,
-                                 dim_t A_rank, dim_t B_rank) {
-    GemmOperandLayout a_layout = classify_gemm_layout_A(config, A_rank);
-    GemmOperandLayout b_layout = classify_gemm_layout_B(config, B_rank);
-    bool a_ok = (a_layout != GemmOperandLayout::Interleaved);
-    bool b_ok = (b_layout != GemmOperandLayout::Interleaved);
-
-    if (!a_ok && !b_ok) {
-        throw std::runtime_error(
-            "CUTLASS GEMM layout incompatible: both A and B have interleaved "
-            "dimension groups. Supported pass-through groupings are "
-            "A: [batch..., free..., contracted...] or [batch..., contracted..., free...], "
-            "B: [batch..., contracted..., free...] or [batch..., free..., contracted...].");
-    }
-    if (!a_ok) {
-        throw std::runtime_error(
-            "CUTLASS GEMM layout incompatible: A has interleaved dimension groups. "
-            "Supported A groupings are [batch..., free..., contracted...] "
-            "or [batch..., contracted..., free...].");
-    }
-    if (!b_ok) {
-        throw std::runtime_error(
-            "CUTLASS GEMM layout incompatible: B has interleaved dimension groups. "
-            "Supported B groupings are [batch..., contracted..., free...] "
-            "or [batch..., free..., contracted...].");
-    }
-}
-
-// Compute permutation to reorder A's dims to one of the GEMM-compatible groupings.
-// perm[src_dim] = dst_dim in the selected ordering.
-inline std::vector<int32_t> compute_gemm_permutation_A_for_layout(
-    const ContractionConfig& config,
-    dim_t A_rank,
-    GemmOperandLayout target_layout) {
+// Compute permutation to reorder the operand's dims to one of the
+// GEMM-compatible groupings.  perm[src_dim] = dst_dim in the selected ordering.
+inline std::vector<int32_t> compute_gemm_permutation_for_layout(
+    const OperandDimGroups& od, GemmOperandLayout target_layout) {
     if (target_layout == GemmOperandLayout::Interleaved) {
-        throw std::runtime_error("A target layout cannot be interleaved");
+        throw std::runtime_error("target layout cannot be interleaved");
     }
 
-    std::vector<int32_t> perm(A_rank);
+    std::vector<int32_t> perm(od.rank);
     int32_t dst = 0;
-    for (int32_t i = 0; i < config.num_batch; ++i)
-        perm[config.batch_pos_A[i]] = dst++;
-    if (target_layout == GemmOperandLayout::Normal) {
-        for (int32_t i = 0; i < config.num_free_A; ++i)
-            perm[config.free_pos_A[i]] = dst++;
-        for (int32_t i = 0; i < config.num_contracted; ++i)
-            perm[config.contracted_pos_A[i]] = dst++;
+    for (int32_t i = 0; i < od.num_batch; ++i)
+        perm[od.batch_pos[i]] = dst++;
+    const bool free_next = (target_layout == GemmOperandLayout::Normal) == od.free_first;
+    if (free_next) {
+        for (int32_t i = 0; i < od.num_free; ++i)
+            perm[od.free_pos[i]] = dst++;
+        for (int32_t i = 0; i < od.num_contracted; ++i)
+            perm[od.contracted_pos[i]] = dst++;
     } else {
-        for (int32_t i = 0; i < config.num_contracted; ++i)
-            perm[config.contracted_pos_A[i]] = dst++;
-        for (int32_t i = 0; i < config.num_free_A; ++i)
-            perm[config.free_pos_A[i]] = dst++;
+        for (int32_t i = 0; i < od.num_contracted; ++i)
+            perm[od.contracted_pos[i]] = dst++;
+        for (int32_t i = 0; i < od.num_free; ++i)
+            perm[od.free_pos[i]] = dst++;
     }
     return perm;
-}
-
-// Compute permutation to reorder B's dims to one of the GEMM-compatible groupings.
-// perm[src_dim] = dst_dim in the selected ordering.
-inline std::vector<int32_t> compute_gemm_permutation_B_for_layout(
-    const ContractionConfig& config,
-    dim_t B_rank,
-    GemmOperandLayout target_layout) {
-    if (target_layout == GemmOperandLayout::Interleaved) {
-        throw std::runtime_error("B target layout cannot be interleaved");
-    }
-
-    std::vector<int32_t> perm(B_rank);
-    int32_t dst = 0;
-    for (int32_t i = 0; i < config.num_batch; ++i)
-        perm[config.batch_pos_B[i]] = dst++;
-    if (target_layout == GemmOperandLayout::Normal) {
-        for (int32_t i = 0; i < config.num_contracted; ++i)
-            perm[config.contracted_pos_B[i]] = dst++;
-        for (int32_t i = 0; i < config.num_free_B; ++i)
-            perm[config.free_pos_B[i]] = dst++;
-    } else {
-        for (int32_t i = 0; i < config.num_free_B; ++i)
-            perm[config.free_pos_B[i]] = dst++;
-        for (int32_t i = 0; i < config.num_contracted; ++i)
-            perm[config.contracted_pos_B[i]] = dst++;
-    }
-    return perm;
-}
-
-// Backward-compatible wrappers for normal (NN) grouped order.
-inline std::vector<int32_t> compute_gemm_permutation_A(
-    const ContractionConfig& config, dim_t A_rank) {
-    return compute_gemm_permutation_A_for_layout(config, A_rank, GemmOperandLayout::Normal);
-}
-
-inline std::vector<int32_t> compute_gemm_permutation_B(
-    const ContractionConfig& config, dim_t B_rank) {
-    return compute_gemm_permutation_B_for_layout(config, B_rank, GemmOperandLayout::Normal);
 }
 
 struct PermutationCandidate {
@@ -350,31 +224,18 @@ inline bool is_better_candidate(const PermutationCandidate& lhs,
            rhs.target_layout != GemmOperandLayout::Normal;
 }
 
-inline PermutationCandidate make_candidate_A(const ContractionConfig& config,
-                                             dim_t A_rank,
-                                             GemmOperandLayout target_layout) {
+inline PermutationCandidate make_candidate(const OperandDimGroups& od,
+                                           GemmOperandLayout target_layout) {
     PermutationCandidate candidate;
     candidate.target_layout = target_layout;
-    candidate.perm = compute_gemm_permutation_A_for_layout(config, A_rank, target_layout);
+    candidate.perm = compute_gemm_permutation_for_layout(od, target_layout);
     candidate.moved_dims = count_moved_dims(candidate.perm);
     candidate.unmoved_tail_dims = count_unmoved_tail_dims(candidate.perm);
     return candidate;
 }
 
-inline PermutationCandidate make_candidate_B(const ContractionConfig& config,
-                                             dim_t B_rank,
-                                             GemmOperandLayout target_layout) {
-    PermutationCandidate candidate;
-    candidate.target_layout = target_layout;
-    candidate.perm = compute_gemm_permutation_B_for_layout(config, B_rank, target_layout);
-    candidate.moved_dims = count_moved_dims(candidate.perm);
-    candidate.unmoved_tail_dims = count_unmoved_tail_dims(candidate.perm);
-    return candidate;
-}
-
-inline GemmLayoutPlan::OperandPlan plan_operand_A(const ContractionConfig& config,
-                                                  dim_t A_rank,
-                                                  GemmOperandLayout current_layout) {
+inline GemmLayoutPlan::OperandPlan plan_operand(const OperandDimGroups& od,
+                                                GemmOperandLayout current_layout) {
     GemmLayoutPlan::OperandPlan out;
     out.original_layout = current_layout;
     out.target_layout = current_layout;
@@ -383,33 +244,8 @@ inline GemmLayoutPlan::OperandPlan plan_operand_A(const ContractionConfig& confi
         return out;
     }
 
-    PermutationCandidate normal = make_candidate_A(config, A_rank, GemmOperandLayout::Normal);
-    PermutationCandidate transposed = make_candidate_A(
-        config, A_rank, GemmOperandLayout::Transposed);
-    const PermutationCandidate& best =
-        is_better_candidate(transposed, normal) ? transposed : normal;
-
-    out.target_layout = best.target_layout;
-    out.perm = best.perm;
-    out.unmoved_tail_dims = best.unmoved_tail_dims;
-    out.dispatch_kind = TransposeDispatchKind::GenericPermute;
-    return out;
-}
-
-inline GemmLayoutPlan::OperandPlan plan_operand_B(const ContractionConfig& config,
-                                                  dim_t B_rank,
-                                                  GemmOperandLayout current_layout) {
-    GemmLayoutPlan::OperandPlan out;
-    out.original_layout = current_layout;
-    out.target_layout = current_layout;
-    out.transpose = (current_layout == GemmOperandLayout::Interleaved);
-    if (!out.transpose) {
-        return out;
-    }
-
-    PermutationCandidate normal = make_candidate_B(config, B_rank, GemmOperandLayout::Normal);
-    PermutationCandidate transposed = make_candidate_B(
-        config, B_rank, GemmOperandLayout::Transposed);
+    PermutationCandidate normal = make_candidate(od, GemmOperandLayout::Normal);
+    PermutationCandidate transposed = make_candidate(od, GemmOperandLayout::Transposed);
     const PermutationCandidate& best =
         is_better_candidate(transposed, normal) ? transposed : normal;
 
@@ -423,12 +259,15 @@ inline GemmLayoutPlan::OperandPlan plan_operand_B(const ContractionConfig& confi
 inline GemmLayoutPlan plan_gemm_layout(const ContractionConfig& config,
                                        dim_t A_rank,
                                        dim_t B_rank) {
-    GemmLayoutPlan plan;
-    plan.layout_A = classify_gemm_layout_A(config, A_rank);
-    plan.layout_B = classify_gemm_layout_B(config, B_rank);
+    const OperandDimGroups od_A = operand_dim_groups(config, A_rank, /*is_A=*/true);
+    const OperandDimGroups od_B = operand_dim_groups(config, B_rank, /*is_A=*/false);
 
-    plan.plan_A = plan_operand_A(config, A_rank, plan.layout_A);
-    plan.plan_B = plan_operand_B(config, B_rank, plan.layout_B);
+    GemmLayoutPlan plan;
+    plan.layout_A = classify_gemm_layout(od_A);
+    plan.layout_B = classify_gemm_layout(od_B);
+
+    plan.plan_A = plan_operand(od_A, plan.layout_A);
+    plan.plan_B = plan_operand(od_B, plan.layout_B);
     plan.transpose_A = plan.plan_A.transpose;
     plan.transpose_B = plan.plan_B.transpose;
     plan.mode_after_transpose =

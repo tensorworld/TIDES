@@ -7,6 +7,7 @@
 #include "work_partitioner.hpp"
 #include "kernels/medium/v2_volume_gemm.cuh"
 #include "kernels/small/warp_gemm.cuh"
+#include "kernels/small/dot_reduce.cuh"
 #include "analysis/pipeline.hpp"
 #include "analysis/dispatchers.hpp"
 #include "analysis/passes/batch_expand.hpp"
@@ -86,13 +87,14 @@ struct PipelineTimingBreakdown {
     double transpose_ms = 0;
     double contraction_ms = 0;
     double accumulation_ms = 0;
+    double output_permute_ms = 0;  // post-contraction permute to einsum output order
     double total_ms = 0;
     // Phase-level timing (plan + prepare + allocate = setup, execute = total_ms)
     double plan_ms = 0;
     double prepare_ms = 0;      // Address-independent shape/geometry build (pipeline_prepare)
     double allocate_ms = 0;     // GPU buffer binding, pointer patching, upload (pipeline_allocate)
     double bind_ms = 0;         // binding/upload subset of allocate (excludes malloc/memset/free)
-    double bind_upload_ms = 0;   // upload_accumulation_map + upload_reduction_plan
+    double bind_upload_ms = 0;   // upload_reduction_plan
     double bind_patch_ms = 0;    // pointer patching + CUTLASS arg prep + small/medium binding
     double bind_stream_ms = 0;   // streaming/transpose setup
     int small_descs = 0;
@@ -137,6 +139,14 @@ inline double ms_since(const std::chrono::high_resolution_clock::time_point& t0)
 }
 } // namespace detail_timing
 
+// Report a non-fatal pipeline error and return false, so bool-returning
+// phase functions can fail in one line: `return pipeline_error("...")`.
+// CUDA API failures still throw via check_cuda.
+inline bool pipeline_error(const char* msg) {
+    std::cerr << "[general_sparse] " << msg << "\n";
+    return false;
+}
+
 // Build ContractionConfig from EinsumIndexSets and tensor labels
 inline ContractionConfig build_contraction_config(
     const EinsumIndexSets& index_sets,
@@ -149,6 +159,7 @@ inline ContractionConfig build_contraction_config(
     config.num_free_A = 0;
     config.num_free_B = 0;
     config.num_batch = 0;
+    config.rank_overflow = 0;
 
     auto find_pos = [](const std::vector<char>& labels, char c) -> int32_t {
         for (std::size_t i = 0; i < labels.size(); ++i) {
@@ -170,6 +181,7 @@ inline ContractionConfig build_contraction_config(
         int32_t pos_A = find_pos(A_labels, c);
         int32_t pos_B = find_pos(B_labels, c);
         if (pos_A >= 0 && pos_B >= 0) {
+            if (config.num_batch >= MAX_RANK) { config.rank_overflow = 1; continue; }
             config.batch_pos_A[config.num_batch] = pos_A;
             config.batch_pos_B[config.num_batch] = pos_B;
             config.num_batch++;
@@ -180,6 +192,7 @@ inline ContractionConfig build_contraction_config(
     for (char c : index_sets.free_indices_A) {
         int32_t pos_A = find_pos(A_labels, c);
         if (pos_A >= 0) {
+            if (config.num_free_A >= MAX_RANK) { config.rank_overflow = 1; continue; }
             config.free_pos_A[config.num_free_A] = pos_A;
             config.num_free_A++;
             internal_order.push_back(c);
@@ -189,6 +202,7 @@ inline ContractionConfig build_contraction_config(
     for (char c : index_sets.free_indices_B) {
         int32_t pos_B = find_pos(B_labels, c);
         if (pos_B >= 0) {
+            if (config.num_free_B >= MAX_RANK) { config.rank_overflow = 1; continue; }
             config.free_pos_B[config.num_free_B] = pos_B;
             config.num_free_B++;
             internal_order.push_back(c);
@@ -199,22 +213,27 @@ inline ContractionConfig build_contraction_config(
         int32_t pos_A = find_pos(A_labels, c);
         int32_t pos_B = find_pos(B_labels, c);
         if (pos_A >= 0 && pos_B >= 0) {
+            if (config.num_contracted >= MAX_RANK) { config.rank_overflow = 1; continue; }
             config.contracted_pos_A[config.num_contracted] = pos_A;
             config.contracted_pos_B[config.num_contracted] = pos_B;
             config.num_contracted++;
         }
     }
 
+    // Output rank is bounded by MAX_RANK: internal_to_output (and every
+    // downstream output-coord array — CoordKeyDynamic, verifier stacks) is
+    // a fixed [MAX_RANK] array. Overflowing writes are clamped and flagged;
+    // pipeline_plan rejects flagged configs loudly.
     config.output_rank = static_cast<int32_t>(internal_order.size());
+    if (config.output_rank > MAX_RANK) config.rank_overflow = 1;
+    const int32_t mapped_rank = std::min(config.output_rank, MAX_RANK);
 
     if (!output_labels.empty()) {
-        for (int32_t i = 0; i < config.output_rank; ++i) {
-            char label = internal_order[i];
-            int32_t out_pos = find_pos_str(output_labels, label);
-            config.internal_to_output[i] = out_pos;
+        for (int32_t i = 0; i < mapped_rank; ++i) {
+            config.internal_to_output[i] = find_pos_str(output_labels, internal_order[i]);
         }
     } else {
-        for (int32_t i = 0; i < config.output_rank; ++i) {
+        for (int32_t i = 0; i < mapped_rank; ++i) {
             config.internal_to_output[i] = i;
         }
     }
@@ -227,7 +246,6 @@ constexpr int HT_TILE_VOL = 1024;   // tile volume (elements per tile)
 constexpr int HT_BLOCK_SIZE = 256;  // CUDA threads per block
 
 struct DispatchConfig {
-    int64_t mn_threshold = DEFAULT_CUTLASS_MN_THRESHOLD;
     int64_t transpose_buf_cap = 0; // 0 = disabled (legacy full-size workspace); >0 = streamed transpose buffer cap in elements
     float output_beta = 0;  // 0 = zero d_output before contraction; 1 = accumulate onto existing d_output
     int vol_max_tiles = 0;  // 0 = auto (256 w/ transpose, 64 w/o); >0 = override
@@ -343,10 +361,12 @@ inline std::vector<uint8_t> compute_trivial_shapes(
 // Only iterates the given block_indices, assembles lightweight HypertileMem
 // and prefix_sum. When bufs != nullptr, uses pre-allocated GPU buffers (streaming).
 // When bufs == nullptr, self-allocates GPU memory (non-streaming).
-template <typename T>
-TransposeFlatMeta assemble_hypertile_batch(
+// block_offsets/block_volumes are element offsets/counts indexed by block id
+// (operand blocks or output blocks — the assembler is layout-agnostic).
+inline TransposeFlatMeta assemble_hypertile_batch(
     const std::vector<int>& block_indices,
-    const GPUSparseInput<T>& gpu,
+    const int64_t* block_offsets,
+    const int64_t* block_volumes,
     const BlockShapeMap& shape_map,
     const HypertileIndex& cache,
     const std::vector<uint8_t>& trivial_shapes,
@@ -369,7 +389,7 @@ TransposeFlatMeta assemble_hypertile_batch(
     // Iterate block_indices, look up cache entry, build mems
     for (size_t bi = 0; bi < block_indices.size(); ++bi) {
         int b = block_indices[bi];
-        if (gpu.block_volumes[b] == 0) continue;
+        if (block_volumes[b] == 0) continue;
 
         uint32_t shape_id = shape_map.block_to_shape[b];
         if (trivial_shapes[shape_id])
@@ -377,8 +397,8 @@ TransposeFlatMeta assemble_hypertile_batch(
         const auto& entry = cache.per_shape[shape_id];
 
         HypertileMem mem{};
-        mem.src_base = gpu.block_offsets[b];
-        mem.dst_base = pack_offset.empty() ? gpu.block_offsets[b] : pack_offset[bi];
+        mem.src_base = block_offsets[b];
+        mem.dst_base = pack_offset.empty() ? block_offsets[b] : pack_offset[bi];
         mem.shape_idx = entry.shape_idx;
 
         auto& acc = accums[entry.slice_idx];
@@ -544,6 +564,55 @@ void free_transposed_values(TransposedValues<T>& tv) {
 // ============================================================================
 
 // ============================================================================
+// Shared execution resources
+// ============================================================================
+
+// Streams and events shared by every plan in the process. Creating a CUDA
+// stream is cheap, but a LIVE stream is not free: device-wide sync cost
+// scales with the number of streams in the context, so per-plan streams
+// make cudaDeviceSynchronize O(#live plans) — ~2 ms/sync with ~1000 cached
+// plans (measured, DMRG workload). Plans reference this context instead of
+// owning resources; executes are serialized per process (the engine's
+// existing single-threaded execute contract), so sharing is safe.
+struct PipelineStreamContext {
+    cudaStream_t stream_large = nullptr;
+    cudaStream_t stream_small = nullptr;
+    cudaStream_t stream_medium = nullptr;
+    cudaStream_t streaming_streams[2] = {};
+    cudaEvent_t transpose_done_flat = nullptr;
+    cudaEvent_t transpose_done_tiled = nullptr;
+    cudaEvent_t gemm_done[2] = {};
+    cudaEvent_t copy_done[2] = {};
+};
+
+inline PipelineStreamContext& get_stream_context() {
+    static PipelineStreamContext ctx = [] {
+        PipelineStreamContext c;
+        check_cuda(cudaStreamCreate(&c.stream_large), "create stream_large");
+        check_cuda(cudaStreamCreate(&c.stream_small), "create stream_small");
+        check_cuda(cudaStreamCreate(&c.stream_medium), "create stream_medium");
+        check_cuda(cudaEventCreateWithFlags(&c.transpose_done_flat,
+                                            cudaEventDisableTiming),
+                   "create transpose_done_flat");
+        check_cuda(cudaEventCreateWithFlags(&c.transpose_done_tiled,
+                                            cudaEventDisableTiming),
+                   "create transpose_done_tiled");
+        for (int i = 0; i < 2; ++i) {
+            check_cuda(cudaStreamCreate(&c.streaming_streams[i]),
+                       "create streaming stream");
+            check_cuda(cudaEventCreateWithFlags(&c.gemm_done[i],
+                                                cudaEventDisableTiming),
+                       "create streaming gemm_done event");
+            check_cuda(cudaEventCreateWithFlags(&c.copy_done[i],
+                                                cudaEventDisableTiming),
+                       "create streaming copy_done event");
+        }
+        return c;
+    }();
+    return ctx;
+}
+
+// ============================================================================
 // PipelinePlan: all state between setup and execute
 // ============================================================================
 
@@ -571,6 +640,11 @@ struct PipelinePlan {
     BlockShapeMap shape_map_A;
     BlockShapeMap shape_map_B;
 
+    // Unique shape-pair plan (built in pipeline_plan): per-pair shape-pair id
+    // + per-unique-shape-pair geometry/tier. Tier preps use it for dense,
+    // hash-free dedup.
+    ShapePairPlan shape_pair_plan;
+
     // Hypertile transpose index (per-operand, built in pipeline_prepare)
     HypertileIndex hypertile_index_A;
     HypertileIndex hypertile_index_B;
@@ -578,6 +652,27 @@ struct PipelinePlan {
     // Per-shape trivial transpose flags (indexed by shape_id, built in pipeline_prepare)
     std::vector<uint8_t> trivial_shapes_A;
     std::vector<uint8_t> trivial_shapes_B;
+
+    // Post-contraction output permute: rearranges each output block from
+    // internal order [batch, free_A, free_B] to einsum output label order.
+    // Contraction tiers always write internal order into d_output; when the
+    // einsum order differs and actually moves data, the permute stage writes
+    // the user-facing buffer d_output_final (same block offsets, permuted
+    // intra-block layout).
+    bool output_permute_needed = false;      // internal_to_output != identity
+    bool output_permute_all_trivial = false; // permuted bytes == internal bytes
+    bool output_permute_copy_first = false;  // mixed trivial/non-trivial blocks
+    BlockShapeMap shape_map_out;             // output-block dims, internal order
+    HypertileIndex hypertile_index_out;
+    std::vector<uint8_t> trivial_shapes_out;
+    TransposeFlatMeta output_permute_meta;
+    T* d_output_final = nullptr;
+    bool owns_output_final = true;
+
+    // True when the permute stage will physically run.
+    bool output_permute_active() const {
+        return output_permute_needed && !output_permute_all_trivial;
+    }
 
     // Work partitioning
     PartitionedWork<T> work{};
@@ -597,6 +692,8 @@ struct PipelinePlan {
     int32_t* d_warp_prefix = nullptr;    // prefix sum of warps per desc (num_descs+1)
     int total_warps = 0;
     int warp_variant = 0;                    // 4-bit: (INT_LARGE<<3)|(INT_K<<2)|(CKA<<1)|CKB
+    int32_t* d_dot_indices = nullptr;    // desc indices routed to dot-reduce kernel
+    int small_num_dots = 0;
 
     // Medium tier (volume GEMM — scatter-gather load + 2×2 register-tile, bypasses transpose)
     VolumeShape* d_medium_vol_shapes = nullptr;
@@ -618,6 +715,13 @@ struct PipelinePlan {
     // Staging from pipeline_plan → pipeline_allocate
     ShapeClassifiedWork<T> staging_classified;
 
+    // Set by pipeline_prepare; pipeline_allocate rejects plans where prepare
+    // was skipped (bind_small_mems would silently drop small-tier work).
+    bool prepare_done = false;
+
+    // Set by pipeline_allocate; pipeline_rebind rejects plans not yet bound.
+    bool allocate_done = false;
+
     // Prepared state (pipeline_prepare → pipeline_allocate)
     struct PreparedSmall {
         std::vector<uint8_t> h_shape_bytes;  // type-erased WarpShape array
@@ -628,6 +732,11 @@ struct PipelinePlan {
         std::vector<PerShape> shape_strides;
         std::vector<uint32_t> key_indices;
         std::vector<int32_t> h_warp_prefix;
+        // Scalar-output (M=N=1, K >= DOT_MIN_K) shapes route to the
+        // dot-reduce kernel: zero warps in the prefix, desc index recorded
+        // here instead (see dot_reduce.cuh).
+        std::vector<uint8_t> shape_is_dot;      // per unique shape
+        std::vector<int32_t> h_dot_desc_indices; // expanded desc indices
         int total_descs = 0;
         int num_shapes = 0;
         int total_warps = 0;
@@ -657,9 +766,10 @@ struct PipelinePlan {
     PreparedMedium prepared_medium;
 
     // Non-streaming tile shapes (from pipeline_prepare)
-    TileShape nonstream_tiles[NUM_SHAPE_QUEUES] = {};
+    KernelChoice nonstream_kernels[NUM_SHAPE_QUEUES] = {};
 
-    // Streams
+    // Streams — references into the shared PipelineStreamContext (set in
+    // pipeline_allocate, never destroyed by the plan)
     cudaStream_t stream_large = nullptr;
     cudaStream_t stream_small = nullptr;
     cudaStream_t stream_medium = nullptr;
@@ -669,9 +779,9 @@ struct PipelinePlan {
         // Shared across queues (sequential execution)
         T* d_buf[2] = {};            // double transpose buffers
         CutlassGemmRunnerResult args[2];  // pre-allocated CUTLASS arg buffers
-        cudaStream_t streams[2] = {};     // two alternating streams
-        cudaEvent_t gemm_done[2] = {};    // GEMM completion events
-        cudaEvent_t copy_done[2] = {};    // H2D args copy completion (for h_args_buf safety)
+        cudaStream_t streams[2] = {};     // two alternating streams (shared context)
+        cudaEvent_t gemm_done[2] = {};    // GEMM completion events (shared context)
+        cudaEvent_t copy_done[2] = {};    // H2D args copy completion (shared context)
         int64_t buf_cap = 0;         // elements per buffer
         int64_t max_expanded_problems = 0;
         bool enabled = false;
@@ -682,7 +792,7 @@ struct PipelinePlan {
         // Per-queue (indexed by ShapeQueue)
         BatchPartitionResult queue_partitions[NUM_SHAPE_QUEUES];
         LargeBlockWork<T> queue_work[NUM_SHAPE_QUEUES];  // final work with ptr_C
-        TileShape queue_tiles[NUM_SHAPE_QUEUES];
+        KernelChoice queue_kernels[NUM_SHAPE_QUEUES];
 
         // Precomputed GEMM + transpose state (first ≤2 batches across all queues).
         // Uses args[0]/args[1] for GEMM, precomp_bufs[slot][op] for transpose.
@@ -693,7 +803,7 @@ struct PipelinePlan {
     };
     StreamingState streaming;
 
-    // Cross-stream sync events for transpose → GEMM ordering
+    // Cross-stream sync events for transpose → GEMM ordering (shared context)
     cudaEvent_t transpose_done_flat = nullptr;
     cudaEvent_t transpose_done_tiled = nullptr;
 
@@ -706,6 +816,17 @@ struct PipelinePlan {
 
     PipelinePlan() = default;
     ~PipelinePlan() {
+        // Drain in-flight work first: an exception mid-execute can leave
+        // kernels running that still read plan-owned buffers, and pool
+        // release (unlike cudaFreeHost) does not synchronize. Normal paths
+        // are already idle, so this costs ~µs.
+        cudaDeviceSynchronize();
+        // Final output: owned until pipeline_extract_result transfers it out
+        // (extract nulls d_output; destruction without extraction frees here).
+        if (owns_output) cudaFree(d_output);
+        // Permuted output buffer: same handoff protocol as d_output.
+        if (owns_output_final) cudaFree(d_output_final);
+        output_permute_meta.free_gpu();
         // Big buffers: only free if we own them (not user-provided workspace)
         if (owns_workspace) {
             cudaFree(streaming.d_buf[0]);
@@ -716,33 +837,20 @@ struct PipelinePlan {
             tv.d_workspace_A = nullptr;
             tv.d_workspace_B = nullptr;
         }
-        streaming.args[0].free_buffers();
-        streaming.args[1].free_buffers();
+        // streaming.args + nonstream_runners repool via their own destructors
         for (int s = 0; s < 2; ++s)
             for (int op = 0; op < 2; ++op)
                 streaming.precomp_bufs[s][op].free_gpu();
-        if (streaming.streams[0]) cudaStreamDestroy(streaming.streams[0]);
-        if (streaming.streams[1]) cudaStreamDestroy(streaming.streams[1]);
-        if (streaming.gemm_done[0]) cudaEventDestroy(streaming.gemm_done[0]);
-        if (streaming.gemm_done[1]) cudaEventDestroy(streaming.gemm_done[1]);
-        if (streaming.copy_done[0]) cudaEventDestroy(streaming.copy_done[0]);
-        if (streaming.copy_done[1]) cudaEventDestroy(streaming.copy_done[1]);
         cudaFree(d_small_shapes);
         cudaFree(d_small_mems);
         cudaFree(d_warp_prefix);
+        cudaFree(d_dot_indices);
         cudaFree(d_medium_vol_shapes);
         cudaFree(d_medium_vol_mems);
-        free_reduction_plan(reduce_plan);
-        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi)
-            nonstream_runners[qi].free_buffers();
+        // reduce_plan and accum_map free themselves (RAII member destructors)
         transpose_precomp_A.free_gpu();
         transpose_precomp_B.free_gpu();
-        free_accumulation_map(accum_map);
-        if (stream_large) cudaStreamDestroy(stream_large);
-        if (stream_small) cudaStreamDestroy(stream_small);
-        if (stream_medium) cudaStreamDestroy(stream_medium);
-        if (transpose_done_flat) cudaEventDestroy(transpose_done_flat);
-        if (transpose_done_tiled) cudaEventDestroy(transpose_done_tiled);
+        // Streams/events belong to the shared PipelineStreamContext.
     }
     // Non-movable, non-copyable. Use pipeline_setup(plan, ...) output parameter.
     PipelinePlan(PipelinePlan&&) = delete;
@@ -801,16 +909,45 @@ inline dim_t compute_small_dim_stride(const dim_t* block_dims, dim_t rank,
         f_strides[fi] = compute_dim_stride(block_dims, rank, pos);
     }
     auto sq = layout::squash_dimensions<WARP_MAX_DIMS>(f_shapes, f_strides, num_free);
-    for (int i = 0; i < sq.rank; ++i)
+    // Product ≤ 3 guarantees at most one non-trivial group, but clamp the
+    // scan to written capacity anyway.
+    for (int i = 0; i < sq.rank && i < WARP_MAX_DIMS; ++i)
         if (sq.shapes[i] > 1) return static_cast<dim_t>(sq.strides[i]);
     return 0;  // product == 1, stride doesn't matter
+}
+
+// Dense (hash-free) dedup of shape_pair_id over one tier's problems: fills
+// key_indices (per-problem local unique index) and first_occ (representative
+// problem index per local unique); returns the local unique count.
+// num_global_shape_pairs bounds the scratch array (shape_pair_plan size).
+inline int dedup_shape_pair_ids(const std::vector<GemmProblemDesc>& problems,
+                                size_t num_global_shape_pairs,
+                                std::vector<uint32_t>& key_indices,
+                                std::vector<int>& first_occ)
+{
+    const int n = static_cast<int>(problems.size());
+    key_indices.resize(n);
+    first_occ.clear();
+    std::vector<int32_t> global_to_local(num_global_shape_pairs, -1);
+    int num_unique = 0;
+    for (int i = 0; i < n; ++i) {
+        int32_t& slot = global_to_local[problems[i].shape_pair_id];
+        if (slot < 0) {
+            slot = num_unique++;
+            first_occ.push_back(i);
+        }
+        key_indices[i] = static_cast<uint32_t>(slot);
+    }
+    return num_unique;
 }
 
 // Build warp shape geometry for a specific desc type (address-independent).
 // Dedup pair shape keys, build WarpShape directly, compute warp prefix.
 // Stores result in plan.prepared_small for later bind_small_mems.
+// Returns false on squashed-rank overflow — an internal error, since the
+// partitioner's rank-eligibility check routes such shapes to CUTLASS.
 template <typename DescType, typename T>
-void prepare_small_shapes_impl(
+bool prepare_small_shapes_impl(
     PipelinePlan<T>& plan,
     const GPUSparseInput<T>& A_gpu,
     const GPUSparseInput<T>& B_gpu)
@@ -820,23 +957,18 @@ void prepare_small_shapes_impl(
 
     const auto& problems = plan.work.small.problems;
     const int n_probs = static_cast<int>(problems.size());
-    if (n_probs == 0) return;
+    if (n_probs == 0) return true;
 
     const auto& config = plan.config;
     const dim_t A_rank = A_gpu.rank;
     const dim_t B_rank = B_gpu.rank;
 
-    // Phase 1: dedup pair shape keys.
-    std::vector<uint64_t> pair_keys(n_probs);
-    for (int i = 0; i < n_probs; ++i)
-        pair_keys[i] = make_pair_shape_key(
-            plan.shape_map_A.block_to_shape[problems[i].block_idx_A],
-            plan.shape_map_B.block_to_shape[problems[i].block_idx_B]);
-
-    std::vector<uint32_t> key_indices(n_probs);
-    std::vector<int> first_occ(n_probs);
-    int num_unique = pair_key_dedup(pair_keys.data(), n_probs,
-                                    key_indices.data(), first_occ.data());
+    // Phase 1: dedup via the shape-pair plan (dense remap, no hashing).
+    std::vector<uint32_t> key_indices;
+    std::vector<int> first_occ;
+    int num_unique = dedup_shape_pair_ids(
+        problems, plan.shape_pair_plan.shape_pairs.size(),
+        key_indices, first_occ);
 
     // Build shape + stride template per unique pair shape key.
     // Also track K contiguity: if ANY shape has squashed innermost K
@@ -907,6 +1039,10 @@ void prepare_small_shapes_impl(
                 }
                 auto sq = layout::squash_dimensions<WARP_MAX_DIMS>(
                     f_shapes, f_strides, num_large);
+                if (!sq.fits())
+                    return pipeline_error(
+                        "prepare_small_shapes: large free dims exceed WARP_MAX_DIMS "
+                        "(internal: partitioner should route this shape to CUTLASS)");
                 s.large.num_dims = static_cast<int8_t>(sq.rank);
                 for (int i = 0; i < sq.rank; ++i) {
                     s.large.dims[i] = static_cast<dim_t>(sq.shapes[i]);
@@ -940,6 +1076,10 @@ void prepare_small_shapes_impl(
             }
             auto sq = layout::squash_dimensions_dual<WARP_MAX_DIMS>(
                 k_shapes, k_strides_a, k_strides_b, config.num_contracted);
+            if (!sq.fits())
+                return pipeline_error(
+                    "prepare_small_shapes: contracted dims exceed WARP_MAX_DIMS "
+                    "(internal: partitioner should route this shape to CUTLASS)");
             s.k.num_dims = static_cast<int8_t>(sq.rank);
             for (int i = 0; i < sq.rank; ++i) {
                 s.k.dims[i] = static_cast<dim_t>(sq.shapes[i]);
@@ -971,13 +1111,21 @@ void prepare_small_shapes_impl(
                     &templates[u].shape, sizeof(ShapeType));
 
     // Per-shape strides (address-independent, used by bind_small_mems).
+    // Scalar-output shapes (M*N == 1) with K >= DOT_MIN_K route to the
+    // dot-reduce kernel: zero warps here, desc indices collected below.
     ps.shape_strides.resize(num_unique);
+    ps.shape_is_dot.assign(static_cast<size_t>(num_unique), 0);
     for (int u = 0; u < num_unique; ++u) {
+        const auto& shp = templates[u].shape;
+        const bool is_dot = (shp.small_size * shp.large_size == 1) &&
+                            (shp.K_total >= DOT_MIN_K);
+        ps.shape_is_dot[u] = is_dot ? 1 : 0;
         ps.shape_strides[u].batch_stride_a = templates[u].batch_stride_a;
         ps.shape_strides[u].batch_stride_b = templates[u].batch_stride_b;
         ps.shape_strides[u].batch_stride_c = templates[u].batch_stride_c;
-        ps.shape_strides[u].warps_per =
-            (templates[u].shape.small_size * templates[u].shape.large_size + 31) / 32;
+        ps.shape_strides[u].warps_per = is_dot
+            ? 0
+            : (shp.small_size * shp.large_size + 31) / 32;
     }
     ps.key_indices = std::move(key_indices);
 
@@ -987,14 +1135,19 @@ void prepare_small_shapes_impl(
         total_descs += problems[p].batch_size;
     ps.total_descs = total_descs;
 
+    ps.h_dot_desc_indices.clear();
     if (total_descs > 0) {
         ps.h_warp_prefix.resize(total_descs + 1);
         ps.h_warp_prefix[0] = 0;
         int idx = 0;
         for (int p = 0; p < n_probs; ++p) {
-            int32_t warps = ps.shape_strides[ps.key_indices[p]].warps_per;
-            for (dim_t b = 0; b < problems[p].batch_size; ++b, ++idx)
+            const uint32_t u = ps.key_indices[p];
+            const int32_t warps = ps.shape_strides[u].warps_per;
+            const bool dot = ps.shape_is_dot[u] != 0;
+            for (dim_t b = 0; b < problems[p].batch_size; ++b, ++idx) {
                 ps.h_warp_prefix[idx + 1] = ps.h_warp_prefix[idx] + warps;
+                if (dot) ps.h_dot_desc_indices.push_back(idx);
+            }
         }
         ps.total_warps = ps.h_warp_prefix[total_descs];
     }
@@ -1002,6 +1155,8 @@ void prepare_small_shapes_impl(
     plan.small_num_descs = total_descs;
     plan.small_num_shapes = num_unique;
     plan.total_warps = ps.total_warps;
+    plan.small_num_dots = static_cast<int>(ps.h_dot_desc_indices.size());
+    return true;
 }
 
 // Build warp shape geometry (address-independent, no GPU alloc).
@@ -1010,7 +1165,7 @@ void prepare_small_shapes_impl(
 // the large dim might sometimes be the simple one, in which case IntDim
 // is filled with num_dims=1 — a trivial single-multiply decode).
 template <typename T>
-void prepare_small_shapes(
+bool prepare_small_shapes(
     PipelinePlan<T>& plan,
     const GPUSparseInput<T>& A_gpu,
     const GPUSparseInput<T>& B_gpu)
@@ -1022,12 +1177,14 @@ void prepare_small_shapes(
     // Build shapes first — contiguity is determined from squashed strides
     // inside prepare_small_shapes_impl, not from original dim positions.
     int desc_type = (int_large ? 2 : 0) | (int_k ? 1 : 0);
+    bool ok = false;
     switch (desc_type) {
-        case 0: prepare_small_shapes_impl<DescSS>(plan, A_gpu, B_gpu); break;
-        case 1: prepare_small_shapes_impl<DescSI>(plan, A_gpu, B_gpu); break;
-        case 2: prepare_small_shapes_impl<DescIS>(plan, A_gpu, B_gpu); break;
-        case 3: prepare_small_shapes_impl<DescII>(plan, A_gpu, B_gpu); break;
+        case 0: ok = prepare_small_shapes_impl<DescSS>(plan, A_gpu, B_gpu); break;
+        case 1: ok = prepare_small_shapes_impl<DescSI>(plan, A_gpu, B_gpu); break;
+        case 2: ok = prepare_small_shapes_impl<DescIS>(plan, A_gpu, B_gpu); break;
+        case 3: ok = prepare_small_shapes_impl<DescII>(plan, A_gpu, B_gpu); break;
     }
+    if (!ok) return false;
 
     // Use squash-derived contiguity from prepared state.
     // The original position-based check can be wrong when squash eliminates
@@ -1037,6 +1194,7 @@ void prepare_small_shapes(
 
     plan.warp_variant = (int_large ? 8 : 0) | (int_k ? 4 : 0) |
                         (contig_k_a ? 2 : 0) | (contig_k_b ? 1 : 0);
+    return true;
 }
 
 // Fill WarpMem with absolute GPU pointers and upload shapes+mems+prefix to GPU.
@@ -1075,29 +1233,44 @@ void bind_small_mems(
         }
     }
 
-    // Upload shapes
-    check_cuda(cudaMalloc(&plan.d_small_shapes, ps.h_shape_bytes.size()),
-               "malloc warp_shapes");
+    // Upload shapes/mems/prefix. Buffers are sized by prepare-time metadata,
+    // which is fixed for the plan's lifetime — on a rebind (pipeline_rebind)
+    // they already exist and only the contents are re-uploaded.
+    if (!plan.d_small_shapes)
+        check_cuda(cudaMalloc(&plan.d_small_shapes, ps.h_shape_bytes.size()),
+                   "malloc warp_shapes");
     check_cuda(cudaMemcpyAsync(plan.d_small_shapes, ps.h_shape_bytes.data(),
                                ps.h_shape_bytes.size(),
                                cudaMemcpyHostToDevice, plan.stream_small),
                "memcpy warp_shapes");
 
-    // Upload mems
-    check_cuda(cudaMalloc(&plan.d_small_mems,
-                          ps.total_descs * sizeof(WarpMem)), "malloc warp_mems");
+    if (!plan.d_small_mems)
+        check_cuda(cudaMalloc(&plan.d_small_mems,
+                              ps.total_descs * sizeof(WarpMem)), "malloc warp_mems");
     check_cuda(cudaMemcpyAsync(plan.d_small_mems, h_mems.data(),
                                ps.total_descs * sizeof(WarpMem),
                                cudaMemcpyHostToDevice, plan.stream_small),
                "memcpy warp_mems");
 
-    // Upload warp prefix sum
-    check_cuda(cudaMalloc(&plan.d_warp_prefix,
-                          (ps.total_descs + 1) * sizeof(int32_t)), "malloc warp_prefix");
+    if (!plan.d_warp_prefix)
+        check_cuda(cudaMalloc(&plan.d_warp_prefix,
+                              (ps.total_descs + 1) * sizeof(int32_t)), "malloc warp_prefix");
     check_cuda(cudaMemcpyAsync(plan.d_warp_prefix, ps.h_warp_prefix.data(),
                                (ps.total_descs + 1) * sizeof(int32_t),
                                cudaMemcpyHostToDevice, plan.stream_small),
                "memcpy warp_prefix");
+
+    if (!ps.h_dot_desc_indices.empty()) {
+        const size_t dot_bytes =
+            ps.h_dot_desc_indices.size() * sizeof(int32_t);
+        if (!plan.d_dot_indices)
+            check_cuda(cudaMalloc(&plan.d_dot_indices, dot_bytes),
+                       "malloc dot_indices");
+        check_cuda(cudaMemcpyAsync(plan.d_dot_indices,
+                                   ps.h_dot_desc_indices.data(), dot_bytes,
+                                   cudaMemcpyHostToDevice, plan.stream_small),
+                   "memcpy dot_indices");
+    }
 }
 
 // Per-contracted-dim info for K decomposition.
@@ -1151,40 +1324,46 @@ inline OperandLoadInfo build_operand_load_info(
     DimEntry entries[VOL_MAX_RANK];
     int n = 0;
 
-    // K tile dims first (innermost) — squash adjacent contiguous dims.
-    // Divmod chain needs innermost first (row-major convention), so we reverse.
-    {
-        auto sq = layout::squash_dimensions<VOL_MAX_RANK>(k_tile_shapes, k_strides, k_rank);
-        for (int i = sq.rank - 1; i >= 0; --i) {
-            assert(n < VOL_MAX_RANK && "K dims exceed VOL_MAX_RANK");
-            entries[n].shape = static_cast<int32_t>(sq.shapes[i]);
-            entries[n].stride = sq.strides[i];
-            n++;
-        }
+    // Squash both dim groups, then check the combined rank BEFORE writing any
+    // arrays. On overflow, return a sentinel rank > VOL_MAX_RANK — callers
+    // (prepare_medium_shapes, volume_rank_eligible) reject such shapes; the
+    // partitioner routes them to CUTLASS.
+    auto sqk = layout::squash_dimensions<VOL_MAX_RANK>(k_tile_shapes, k_strides, k_rank);
+
+    int32_t free_shapes[MAX_RANK];
+    int64_t free_strides[MAX_RANK];
+    for (int i = 0; i < num_free; ++i) {
+        free_shapes[i] = static_cast<int32_t>(block_dims[free_pos[i]]);
+        free_strides[i] = compute_dim_stride(block_dims, block_rank, free_pos[i]);
+    }
+    auto sqf = layout::squash_dimensions<VOL_MAX_RANK>(free_shapes, free_strides, num_free);
+
+    OperandLoadInfo out{};
+    if (!sqk.fits() || !sqf.fits() || sqk.rank + sqf.rank > VOL_MAX_RANK) {
+        out.rank = VOL_MAX_RANK + 1;  // sentinel: volume-ineligible
+        out.tile_volume = 0;
+        return out;
     }
 
-    // Free dims next (outermost) — squash, then reverse for divmod chain.
-    {
-        int32_t free_shapes[MAX_RANK];
-        int64_t free_strides[MAX_RANK];
-        for (int i = 0; i < num_free; ++i) {
-            free_shapes[i] = static_cast<int32_t>(block_dims[free_pos[i]]);
-            free_strides[i] = compute_dim_stride(block_dims, block_rank, free_pos[i]);
-        }
-        auto sq = layout::squash_dimensions<VOL_MAX_RANK>(free_shapes, free_strides, num_free);
-        for (int i = sq.rank - 1; i >= 0; --i) {
-            assert(n < VOL_MAX_RANK && "free dims exceed VOL_MAX_RANK");
-            entries[n].shape = static_cast<int32_t>(sq.shapes[i]);
-            entries[n].stride = sq.strides[i];
-            n++;
-        }
+    // K tile dims first (innermost). Divmod chain needs innermost first
+    // (row-major convention), so we reverse.
+    for (int i = sqk.rank - 1; i >= 0; --i) {
+        entries[n].shape = static_cast<int32_t>(sqk.shapes[i]);
+        entries[n].stride = sqk.strides[i];
+        n++;
+    }
+
+    // Free dims next (outermost) — reversed for the divmod chain.
+    for (int i = sqf.rank - 1; i >= 0; --i) {
+        entries[n].shape = static_cast<int32_t>(sqf.shapes[i]);
+        entries[n].stride = sqf.strides[i];
+        n++;
     }
 
     // Degenerate safety: all dims were size 1
     if (n == 0) { entries[0] = {1, 0}; n = 1; }
 
     // Build divmod chain: divmod[0] is innermost (first K dim)
-    OperandLoadInfo out{};
     out.rank = n;
     out.tile_volume = 1;
     for (int i = 0; i < n; ++i) {
@@ -1200,6 +1379,197 @@ inline OperandLoadInfo build_operand_load_info(
     return out;
 }
 
+// ---- Partition-time rank-eligibility checks --------------------------------
+// The warp and volume desc formats hold a bounded number of squashed dims
+// (WARP_MAX_DIMS / VOL_MAX_RANK). Shapes whose squashed rank exceeds those
+// capacities must be routed to CUTLASS at partition time; the desc builders
+// treat overflow as an internal error. Squashing never increases rank, so
+// pipeline_plan only consults these (memoized per unique shape pair) when the
+// config's raw dim counts could overflow — the common case costs nothing.
+
+// True iff the warp-tier desc format can represent this shape pair:
+// squashed large-side free rank and dual-squashed K rank ≤ WARP_MAX_DIMS.
+// (The small side has product ≤ 3 → at most one non-trivial dim, always safe.)
+inline bool warp_rank_eligible(
+    const ContractionConfig& config,
+    const dim_t* A_dims, dim_t A_rank,
+    const dim_t* B_dims, dim_t B_rank,
+    int64_t M, int64_t N)
+{
+    // Mirror prepare_small_shapes_impl: the larger free dim uses IntDim.
+    const bool m_small = (M <= N);
+    const dim_t* large_dims = m_small ? B_dims : A_dims;
+    dim_t large_rank = m_small ? B_rank : A_rank;
+    const int32_t* large_pos = m_small ? config.free_pos_B : config.free_pos_A;
+    int32_t num_large = m_small ? config.num_free_B : config.num_free_A;
+
+    if (num_large > 1) {
+        int32_t f_shapes[MAX_RANK];
+        int64_t f_strides[MAX_RANK];
+        for (int32_t fi = 0; fi < num_large; ++fi) {
+            int32_t pos = large_pos[fi];
+            f_shapes[fi] = static_cast<int32_t>(large_dims[pos]);
+            f_strides[fi] = compute_dim_stride(large_dims, large_rank, pos);
+        }
+        if (!layout::squash_dimensions<WARP_MAX_DIMS>(
+                f_shapes, f_strides, num_large).fits())
+            return false;
+    }
+
+    if (config.num_contracted > 1) {
+        int32_t k_shapes[MAX_RANK];
+        int64_t k_strides_a[MAX_RANK], k_strides_b[MAX_RANK];
+        for (int32_t ci = 0; ci < config.num_contracted; ++ci) {
+            int32_t pos_a = config.contracted_pos_A[ci];
+            int32_t pos_b = config.contracted_pos_B[ci];
+            k_shapes[ci] = static_cast<int32_t>(A_dims[pos_a]);
+            k_strides_a[ci] = compute_dim_stride(A_dims, A_rank, pos_a);
+            k_strides_b[ci] = compute_dim_stride(B_dims, B_rank, pos_b);
+        }
+        if (!layout::squash_dimensions_dual<WARP_MAX_DIMS>(
+                k_shapes, k_strides_a, k_strides_b, config.num_contracted).fits())
+            return false;
+    }
+    return true;
+}
+
+// True iff the volume-tier desc format can represent this shape pair:
+// combined squashed K+free rank ≤ VOL_MAX_RANK for both operands.
+inline bool volume_rank_eligible(
+    const ContractionConfig& config,
+    const dim_t* A_dims, dim_t A_rank,
+    const dim_t* B_dims, dim_t B_rank)
+{
+    KDimInfo k_dims[MAX_RANK];
+    int num_k = build_k_dims(config, A_dims, A_rank, B_dims, B_rank, k_dims);
+
+    int32_t k_shapes[MAX_RANK];
+    int64_t k_strides_A[MAX_RANK], k_strides_B[MAX_RANK];
+    for (int d = 0; d < num_k; ++d) {
+        k_shapes[d] = k_dims[d].dim;
+        k_strides_A[d] = k_dims[d].stride_a;
+        k_strides_B[d] = k_dims[d].stride_b;
+    }
+
+    OperandLoadInfo A_info = build_operand_load_info(
+        config.free_pos_A, config.num_free_A,
+        k_shapes, k_strides_A, num_k, A_dims, A_rank);
+    if (A_info.rank > VOL_MAX_RANK) return false;
+    OperandLoadInfo B_info = build_operand_load_info(
+        config.free_pos_B, config.num_free_B,
+        k_shapes, k_strides_B, num_k, B_dims, B_rank);
+    return B_info.rank <= VOL_MAX_RANK;
+}
+
+// Build the unique shape-pair plan: dedup (shape_A, shape_B) across pairs and
+// compute GEMM geometry + tier ONCE per unique shape pair. Per-pair cost in
+// partition_by_threshold drops to a table lookup, and the tier preps reuse
+// shape_pair_id for hash-free dedup.
+// Tier rules:
+//   warp:   min(M,N) < MIN_CUTLASS_DIM && max(M,N) <= MAX_WARP_DIM
+//   volume: vol_tile_count <= tile_limit && M*K + N*K <= vol_threshold
+//   CUTLASS otherwise. Warp/volume additionally require the squashed-rank
+//   eligibility checks (their desc formats hold a bounded number of dims);
+//   squash never increases rank, so configs whose raw dim counts fit skip
+//   those checks entirely.
+template <typename T>
+ShapePairPlan build_shape_pair_plan(
+    const GPUSparseInput<T>& A_gpu,
+    const GPUSparseInput<T>& B_gpu,
+    const std::vector<BlockPairInfo>& pairs,
+    const ContractionConfig& config,
+    const BlockShapeMap& shape_map_A,
+    const BlockShapeMap& shape_map_B,
+    GemmMode gemm_mode,
+    bool needs_transpose,
+    int vol_max_tiles_override)
+{
+    ShapePairPlan sp;
+    const int n = static_cast<int>(pairs.size());
+    if (n == 0) return sp;
+
+    std::vector<uint64_t> keys(n);
+    for (int i = 0; i < n; ++i)
+        keys[i] = make_pair_shape_key(
+            shape_map_A.block_to_shape[pairs[i].block_idx_A],
+            shape_map_B.block_to_shape[pairs[i].block_idx_B]);
+    sp.pair_shape_id.resize(n);
+    std::vector<int> first_occ(n);
+    const int num_unique = pair_key_dedup(keys.data(), n,
+                                          sp.pair_shape_id.data(),
+                                          first_occ.data());
+
+    // Volume shape gate: tiles ≤ 256 (8-warp CTA) when transpose is needed,
+    // tiles ≤ 64 (2-warp CTA) otherwise.  Override via config.
+    const int vol_tile_limit = (vol_max_tiles_override > 0)
+        ? vol_max_tiles_override
+        : (needs_transpose ? VOL_MAX_TILES : VOL_MAX_TILES_NO_TRANSPOSE);
+
+    const bool warp_may_overflow =
+        std::max(config.num_free_A, config.num_free_B) > WARP_MAX_DIMS ||
+        config.num_contracted > WARP_MAX_DIMS;
+    const bool vol_may_overflow =
+        std::max(config.num_free_A, 1) + std::max(config.num_contracted, 1) >
+            VOL_MAX_RANK ||
+        std::max(config.num_free_B, 1) + std::max(config.num_contracted, 1) >
+            VOL_MAX_RANK;
+
+    sp.shape_pairs.resize(num_unique);
+    for (int u = 0; u < num_unique; ++u) {
+        const BlockPairInfo& pair = pairs[first_occ[u]];
+        const dim_t* A_dims = shape_map_A.shape_dims(
+            shape_map_A.block_to_shape[pair.block_idx_A]);
+        const dim_t* B_dims = shape_map_B.shape_dims(
+            shape_map_B.block_to_shape[pair.block_idx_B]);
+
+        ShapePairInfo& info = sp.shape_pairs[u];
+        compute_gemm_dimensions(A_dims, B_dims, A_gpu.rank, B_gpu.rank,
+                                /*A_blk_idx=*/0, /*B_blk_idx=*/0, config,
+                                info.M, info.N, info.K, info.batch_size);
+        info.lda = gemm_mode_a_transposed(gemm_mode) ? info.M : info.K;
+        info.ldb = gemm_mode_b_transposed(gemm_mode) ? info.K : info.N;
+        info.ldc = info.N;
+
+        if (std::min(info.M, info.N) < MIN_CUTLASS_DIM &&
+            std::max(info.M, info.N) <= MAX_WARP_DIM &&
+            (!warp_may_overflow ||
+             warp_rank_eligible(config, A_dims, A_gpu.rank, B_dims, B_gpu.rank,
+                                info.M, info.N))) {
+            info.tier = 0;
+        } else if (vol_tile_count(info.M, info.N) <= vol_tile_limit &&
+                   (static_cast<int64_t>(info.M) * info.K +
+                    static_cast<int64_t>(info.N) * info.K) <= vol_threshold<T>() &&
+                   (!vol_may_overflow ||
+                    volume_rank_eligible(config, A_dims, A_gpu.rank,
+                                         B_dims, B_gpu.rank))) {
+            info.tier = 1;
+        } else {
+            info.tier = 2;
+        }
+    }
+
+    // Diagnostic dump: BSPTC_DUMP_SHAPE_PLAN=<min_K> prints every unique
+    // shape pair with K >= min_K to stderr (one line per unique shape,
+    // with the number of block pairs mapping to it).
+    static const long dump_min_k = [] {
+        const char* s = std::getenv("BSPTC_DUMP_SHAPE_PLAN");
+        return s && *s ? std::strtol(s, nullptr, 10) : -1;
+    }();
+    if (dump_min_k >= 0) {
+        std::vector<int> uses(static_cast<size_t>(num_unique), 0);
+        for (int i = 0; i < n; ++i) uses[sp.pair_shape_id[i]]++;
+        for (int u = 0; u < num_unique; ++u) {
+            const ShapePairInfo& info = sp.shape_pairs[u];
+            if (info.K < dump_min_k) continue;
+            fprintf(stderr,
+                    "[shape_plan] tier=%d M=%d N=%d K=%d batch=%d pairs=%d\n",
+                    static_cast<int>(info.tier), info.M, info.N, info.K,
+                    info.batch_size, uses[u]);
+        }
+    }
+    return sp;
+}
+
 // Build VolumeShape geometry (address-independent, no GPU alloc).
 // Dedup pair shape keys, compute divmod/strides per unique shape.
 // Stores result in plan.prepared_medium for later bind_medium_mems.
@@ -1213,17 +1583,28 @@ bool prepare_medium_shapes(
     const int n_probs = static_cast<int>(problems.size());
     if (n_probs == 0) return true;
 
-    // Dedup pair shape keys.
-    std::vector<uint64_t> pair_keys(n_probs);
-    for (int i = 0; i < n_probs; ++i)
-        pair_keys[i] = make_pair_shape_key(
-            plan.shape_map_A.block_to_shape[problems[i].block_idx_A],
-            plan.shape_map_B.block_to_shape[problems[i].block_idx_B]);
-
+    // Single pass over problems (a multi-MB stream at scale): dedup shape
+    // pairs via dense remap of shape_pair_id (no hashing), sum batch sizes,
+    // and count problems per output block.
+    const int64_t nob = plan.accum_map.num_output_blocks;
+    std::vector<int32_t> ob_count(static_cast<size_t>(nob), 0);
     std::vector<uint32_t> key_indices(n_probs);
-    std::vector<int> first_occ(n_probs);
-    int num_unique = pair_key_dedup(pair_keys.data(), n_probs,
-                                    key_indices.data(), first_occ.data());
+    std::vector<int> first_occ;
+    std::vector<int32_t> global_to_local(
+        plan.shape_pair_plan.shape_pairs.size(), -1);
+    int num_unique = 0;
+    int total = 0;
+    for (int i = 0; i < n_probs; ++i) {
+        int32_t& slot = global_to_local[problems[i].shape_pair_id];
+        if (slot < 0) {
+            slot = num_unique++;
+            first_occ.push_back(i);
+        }
+        key_indices[i] = static_cast<uint32_t>(slot);
+        total += problems[i].batch_size;
+        ob_count[static_cast<size_t>(
+            plan.accum_map.h_pair_output_block_idx[problems[i].pair_idx])]++;
+    }
 
     auto& pm = plan.prepared_medium;
     pm.h_shapes.reserve(num_unique);
@@ -1305,10 +1686,6 @@ bool prepare_medium_shapes(
 
     pm.key_indices = std::move(key_indices);
     pm.num_shapes = static_cast<int>(pm.h_shapes.size());
-
-    int total = 0;
-    for (int p = 0; p < n_probs; ++p)
-        total += problems[p].batch_size;
     pm.total_descs = total;
     pm.max_smem_elems = max_smem;
     pm.max_tiles = max_tc;
@@ -1317,15 +1694,9 @@ bool prepare_medium_shapes(
     plan.medium_vol_max_smem_elems = pm.max_smem_elems;
     plan.medium_vol_max_tiles = pm.max_tiles;
 
-    // Group medium problems by output block (CSR flat arrays).
-    // bind_medium_mems iterates in this order to produce C-pointer-sorted
-    // mems without an O(n log n) sort.
-    const int64_t nob = plan.accum_map.num_output_blocks;
-    std::vector<int32_t> ob_count(static_cast<size_t>(nob), 0);
-    for (int p = 0; p < n_probs; ++p)
-        ob_count[static_cast<size_t>(
-            plan.accum_map.h_pair_output_block_idx[problems[p].pair_idx])]++;
-
+    // Group medium problems by output block (CSR flat arrays; counts come
+    // from the fused pass above). bind_medium_mems iterates in this order
+    // to produce C-pointer-sorted mems without an O(n log n) sort.
     pm.ob_offsets.resize(static_cast<size_t>(nob) + 1);
     pm.ob_offsets[0] = 0;
     for (int64_t ob = 0; ob < nob; ++ob)
@@ -1359,10 +1730,8 @@ bool bind_medium_mems(
     const auto& problems = plan.work.medium.problems;
     const int n_probs = static_cast<int>(problems.size());
     if (n_probs == 0) return true;
-    if (pm.key_indices.size() != static_cast<size_t>(n_probs)) {
-        std::cerr << "bind_medium_mems: pipeline_prepare not called\n";
-        return false;
-    }
+    if (pm.key_indices.size() != static_cast<size_t>(n_probs))
+        return pipeline_error("bind_medium_mems: pipeline_prepare not called");
 
     // Emit mems in output-block order (from prepare's CSR grouping).
     // Within each OB, iterate batch elements then pairs so that mems
@@ -1416,19 +1785,23 @@ bool bind_medium_mems(
     plan.medium_vol_num_problems = static_cast<int>(h_mems.size());
 
     if (plan.medium_vol_num_problems > 0) {
-        // Upload shapes
-        check_cuda(cudaMalloc(&plan.d_medium_vol_shapes,
-                              pm.h_shapes.size() * sizeof(VolumeShape)),
-                   "malloc d_medium_vol_shapes");
+        // Upload shapes/mems. Sizes are fixed by prepare-time metadata — on a
+        // rebind (pipeline_rebind) the buffers exist and are re-filled in place.
+        if (!plan.d_medium_vol_shapes)
+            check_cuda(malloc_device_cached(
+                           reinterpret_cast<void**>(&plan.d_medium_vol_shapes),
+                           pm.h_shapes.size() * sizeof(VolumeShape)),
+                       "malloc d_medium_vol_shapes");
         check_cuda(cudaMemcpyAsync(plan.d_medium_vol_shapes, pm.h_shapes.data(),
                                     pm.h_shapes.size() * sizeof(VolumeShape),
                                     cudaMemcpyHostToDevice, plan.stream_medium),
                    "memcpy d_medium_vol_shapes");
 
-        // Upload mems
-        check_cuda(cudaMalloc(&plan.d_medium_vol_mems,
-                              h_mems.size() * sizeof(VolumeMem)),
-                   "malloc d_medium_vol_mems");
+        if (!plan.d_medium_vol_mems)
+            check_cuda(malloc_device_cached(
+                           reinterpret_cast<void**>(&plan.d_medium_vol_mems),
+                           h_mems.size() * sizeof(VolumeMem)),
+                       "malloc d_medium_vol_mems");
         check_cuda(cudaMemcpyAsync(plan.d_medium_vol_mems, h_mems.data(),
                                     h_mems.size() * sizeof(VolumeMem),
                                     cudaMemcpyHostToDevice, plan.stream_medium),
@@ -1437,10 +1810,151 @@ bool bind_medium_mems(
     return true;
 }
 
+// --- pipeline_plan step: early streaming partition --------------------------
+// Classifies CUTLASS work into shape queues and partitions each queue into
+// streaming batches. Pairs that partitioning separates out are rerouted to
+// d_output (pair_tier 0) and recorded in separated_pair_indices.
+// Returns whether streaming is enabled (transpose_buf_cap > 0 and large work).
+template <typename T>
+bool plan_streaming_separation(
+    PipelinePlan<T>& plan,
+    const GPUSparseInput<T>& A_gpu,
+    const GPUSparseInput<T>& B_gpu,
+    const DispatchConfig& dispatch_config,
+    std::vector<uint8_t>& pair_tier,
+    std::vector<size_t>& separated_pair_indices)
+{
+    if (dispatch_config.transpose_buf_cap <= 0 || plan.work.large.empty())
+        return false;
+
+    plan.staging_classified = classify_cutlass_work(plan.work);
+    merge_small_queues(plan.staging_classified);
+    for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
+        auto& qwork = plan.staging_classified.queues[qi];
+        if (qwork.empty()) continue;
+        auto qpart = partition_large_smart(
+            qwork, A_gpu, B_gpu, plan.accum_map,
+            dispatch_config.transpose_buf_cap);
+        compute_pair_separation(qpart, qwork, plan.accum_map);
+        if (!qpart.pair_separated.empty()) {
+            for (size_t li = 0; li < qwork.problems.size(); ++li) {
+                if (qpart.pair_separated[li]) {
+                    size_t pi = static_cast<size_t>(qwork.problems[li].pair_idx);
+                    pair_tier[pi] = 0;
+                    separated_pair_indices.push_back(pi);
+                }
+            }
+        }
+        plan.streaming.queue_partitions[qi] = std::move(qpart);
+    }
+    return true;
+}
+
+// --- pipeline_plan step: temp-buffer sizing + per-pair offsets ---------------
+// Detects direct-write CUTLASS pairs (sole temp-tier writer of a non-mixed
+// output block, which can bypass the temp buffer), then assigns temp-buffer
+// offsets to the rest: streaming reuses slots across (queue, batch) groups
+// (serialized batches accumulate via CUTLASS beta=1), non-streaming packs
+// each pair into its own slot. Sets pairs_host[].output_offset and
+// plan.total_pair_output_size.
+template <typename T>
+void plan_temp_buffer_offsets(
+    PipelinePlan<T>& plan,
+    const std::vector<uint8_t>& pair_tier,
+    const std::vector<uint8_t>& is_direct,
+    bool early_can_stream)
+{
+    const size_t np = static_cast<size_t>(plan.num_pairs);
+
+    int64_t compact_offset = 0;
+    if (early_can_stream) {
+        // Streaming: reuse temp slots across batches for the same output block.
+        // Pairs in different (queue, batch) groups are serialized, so they can
+        // share a temp slot and accumulate via CUTLASS beta=1.
+
+        // Build pair_idx → (queue << 32 | batch) concurrent-group key; the
+        // packed form cannot collide across queues at any batch count.
+        // Flat array indexed by pair (-1 = not in any batch); avoids hash-map
+        // churn on the O(num_pairs) hot path.
+        std::vector<int64_t> pair_qb(np, -1);
+        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
+            const auto& qwork = plan.staging_classified.queues[qi];
+            const auto& qpart = plan.streaming.queue_partitions[qi];
+            for (int bi = 0; bi < static_cast<int>(qpart.batches.size()); ++bi) {
+                int64_t key = (static_cast<int64_t>(qi) << 32) |
+                              static_cast<uint32_t>(bi);
+                for (int li : qpart.batches[bi].problem_indices) {
+                    pair_qb[static_cast<size_t>(qwork.problems[li].pair_idx)] = key;
+                }
+            }
+        }
+
+        // Per output block: find max concurrent pairs, assign shared offsets.
+        // Scratch vectors reused across blocks; groups per block are few, so
+        // a linear scan over (key, count) beats a hash map.
+        std::vector<size_t> ob_pairs;
+        std::vector<std::pair<int64_t, int>> group_slots;  // (qb key, next slot)
+        for (int64_t ob = 0; ob < plan.accum_map.num_output_blocks; ++ob) {
+            const int64_t begin = plan.accum_map.h_output_pair_offsets[ob];
+            const int64_t end = plan.accum_map.h_output_pair_offsets[ob + 1];
+
+            // Collect non-direct CUTLASS pairs for this output block
+            ob_pairs.clear();
+            for (int64_t i = begin; i < end; ++i) {
+                size_t pi = static_cast<size_t>(plan.accum_map.h_output_pair_indices[i]);
+                if (pair_tier[pi] != 0 && !is_direct[pi])
+                    ob_pairs.push_back(pi);
+            }
+            if (ob_pairs.empty()) continue;
+
+            int64_t volume = plan.pairs_host[ob_pairs[0]].output_volume;
+
+            // Count pairs per concurrent group; find max
+            group_slots.clear();
+            int max_slots = 0;
+            for (size_t pi : ob_pairs) {
+                const int64_t key = pair_qb[pi];
+                int cnt = 0;
+                for (auto& [k, c] : group_slots) {
+                    if (k == key) { cnt = ++c; break; }
+                }
+                if (cnt == 0) { group_slots.emplace_back(key, 1); cnt = 1; }
+                max_slots = std::max(max_slots, cnt);
+            }
+
+            // Assign offsets: pairs in same (queue, batch) get sequential slots
+            int64_t block_base = compact_offset;
+            compact_offset += static_cast<int64_t>(max_slots) * volume;
+
+            for (auto& [k, c] : group_slots) c = 0;  // reuse as next-slot cursor
+            for (size_t pi : ob_pairs) {
+                const int64_t key = pair_qb[pi];
+                int slot = 0;
+                for (auto& [k, c] : group_slots) {
+                    if (k == key) { slot = c++; break; }
+                }
+                plan.pairs_host[pi].output_offset =
+                    block_base + static_cast<int64_t>(slot) * volume;
+            }
+        }
+    } else {
+        // Non-streaming: each pair gets a unique temp slot
+        for (size_t p = 0; p < np; ++p) {
+            if (pair_tier[p] != 0 && !is_direct[p]) {
+                plan.pairs_host[p].output_offset = compact_offset;
+                compact_offset += plan.pairs_host[p].output_volume;
+            }
+        }
+    }
+    plan.total_pair_output_size = compact_offset;
+}
+
 // ============================================================================
 // Phase 1: CPU planning + small GPU allocs. No big buffer allocation.
-// After this returns, call pipeline_query_workspace() to get buffer sizes,
-// then pipeline_allocate() to bind buffers and finalize GPU setup.
+// After this returns, call pipeline_prepare() to build shape/geometry state,
+// pipeline_query_workspace() to get buffer sizes, then pipeline_allocate()
+// to bind buffers and finalize GPU setup. Skipping pipeline_prepare is
+// rejected by pipeline_allocate.
 // ============================================================================
 template <typename T>
 bool pipeline_plan(
@@ -1457,23 +1971,41 @@ bool pipeline_plan(
 
     plan.timing = timing;
     plan.output_beta = dispatch_config.output_beta;
+    plan.prepare_done = false;  // re-planning invalidates any prior prepare
 
     plan.config = build_contraction_config(
         index_sets, A_gpu.labels, B_gpu.labels, output_labels);
     plan.output_rank = plan.config.output_rank;
 
+    // Fixed-capacity guard: ContractionConfig arrays (and every downstream
+    // output-coord array) hold at most MAX_RANK entries. build_contraction_config
+    // clamps overflowing writes and sets rank_overflow; reject here before any
+    // clamped (unusable) config reaches preprocessing.
+    if (plan.config.rank_overflow)
+        return pipeline_error(
+            "pipeline_plan: contraction rank exceeds MAX_RANK "
+            "(output rank or per-category dim count too large)");
+
+    // Post-contraction permute needed when the einsum output label order
+    // differs from internal order [batch, free_A, free_B].
+    plan.output_permute_needed = false;
+    for (int32_t d = 0; d < plan.config.output_rank; ++d)
+        if (plan.config.internal_to_output[d] != d)
+            plan.output_permute_needed = true;
+    if (plan.output_permute_needed && dispatch_config.output_beta != 0)
+        return pipeline_error(
+            "pipeline_plan: output_beta != 0 requires the einsum output order "
+            "to match internal order (accumulating onto a permuted output "
+            "buffer is not supported)");
+
     // Enforce batch-leftmost constraint: batch dimensions must occupy positions
     // 0..num_batch-1 in both operands. This guarantees that volume and warp
     // kernels can handle interleaved layouts natively without pre-transpose.
     if (plan.config.num_batch > 0) {
-        if (!batch_dims_are_leading(plan.config.batch_pos_A, plan.config.num_batch)) {
-            std::cerr << "pipeline_plan: batch dims not leading in A\n";
-            return false;
-        }
-        if (!batch_dims_are_leading(plan.config.batch_pos_B, plan.config.num_batch)) {
-            std::cerr << "pipeline_plan: batch dims not leading in B\n";
-            return false;
-        }
+        if (!batch_dims_are_leading(plan.config.batch_pos_A, plan.config.num_batch))
+            return pipeline_error("pipeline_plan: batch dims not leading in A");
+        if (!batch_dims_are_leading(plan.config.batch_pos_B, plan.config.num_batch))
+            return pipeline_error("pipeline_plan: batch dims not leading in B");
     }
 
     // Host-side hash join: find matching block pairs (no GPU alloc)
@@ -1509,22 +2041,33 @@ bool pipeline_plan(
     const bool physical_transpose_needed = plan.layout_plan.plan_A.transpose ||
                                           plan.layout_plan.plan_B.transpose;
 
-    // Single classification pass — no device pointers needed, pure tier assignment.
-    // Volume eligibility is always true; per-problem M,N and volume-threshold
-    // checks in partition_by_threshold do the real gating, and the post-squash
-    // rank guard in setup_medium_volume_descs catches any remaining cases.
-    plan.work = partition_by_threshold(
+    // Per-tensor block shape dedup: blocks with identical dims share a shape ID.
+    // Built before partitioning: the rank-eligibility memo below is keyed by
+    // pair shape ID, and downstream desc setup reuses the maps to compute
+    // geometry once per unique shape rather than once per block.
+    plan.shape_map_A = build_block_shape_map(
+        A_gpu.block_dims.data(), A_gpu.num_blocks, A_gpu.rank);
+    plan.shape_map_B = build_block_shape_map(
+        B_gpu.block_dims.data(), B_gpu.num_blocks, B_gpu.rank);
+
+    // Unique shape-pair plan: geometry, rank eligibility, and tier computed
+    // once per unique (shape_A, shape_B) pair.
+    plan.shape_pair_plan = build_shape_pair_plan(
         A_gpu, B_gpu, plan.pairs_host, plan.config,
-        plan.gemm_mode, /*volume_eligible=*/true,
+        plan.shape_map_A, plan.shape_map_B, plan.gemm_mode,
         /*needs_transpose=*/physical_transpose_needed,
         dispatch_config.vol_max_tiles);
 
-    // Build work_tier: 0 = warp, 1 = volume, 2 = CUTLASS (for AccumulationMap flags).
-    std::vector<uint8_t> work_tier(static_cast<size_t>(plan.num_pairs), 2);
-    for (const auto& prob : plan.work.small.problems)
-        work_tier[static_cast<size_t>(prob.pair_idx)] = 0;
-    for (const auto& prob : plan.work.medium.problems)
-        work_tier[static_cast<size_t>(prob.pair_idx)] = 1;
+    // Single classification pass — pure assembly from the shape-pair plan.
+    plan.work = partition_by_threshold(
+        A_gpu, B_gpu, plan.pairs_host, plan.shape_pair_plan, plan.gemm_mode);
+
+    // work_tier: 0 = warp, 1 = volume, 2 = CUTLASS (for AccumulationMap flags),
+    // read straight from the shape-pair plan (no per-tier rebuild loops).
+    std::vector<uint8_t> work_tier(static_cast<size_t>(plan.num_pairs));
+    for (size_t p = 0; p < work_tier.size(); ++p)
+        work_tier[p] = plan.shape_pair_plan
+                           .shape_pairs[plan.shape_pair_plan.pair_shape_id[p]].tier;
 
     t_stage = clock::now();
     if (output_blocks) {
@@ -1540,156 +2083,32 @@ bool pipeline_plan(
     }
     if (timing) { timing->accum_map_ms = detail_timing::ms_since(t_stage); }
 
-    // Per-tensor block shape dedup: blocks with identical dims share a shape ID.
-    // Downstream desc setup uses this to squash/compute geometry once per unique
-    // shape rather than once per block.
-    plan.shape_map_A = build_block_shape_map(
-        A_gpu.block_dims.data(), A_gpu.num_blocks, A_gpu.rank);
-    plan.shape_map_B = build_block_shape_map(
-        B_gpu.block_dims.data(), B_gpu.num_blocks, B_gpu.rank);
-
     // Build pair_tier: 0 = small/volume (writes directly to d_output with atomics),
     //                  2 = large/CUTLASS (writes to temp buffer, eligible for direct-write)
     // Volume tier (medium) writes directly to d_output like warp, so pair_tier = 0.
-    std::vector<uint8_t> pair_tier(static_cast<size_t>(plan.num_pairs), 0);
-    for (const auto& prob : plan.work.large.problems)
-        pair_tier[static_cast<size_t>(prob.pair_idx)] = 2;
+    // Derived from work_tier: large tier (2) is the default there.
+    std::vector<uint8_t> pair_tier(static_cast<size_t>(plan.num_pairs));
+    for (size_t p = 0; p < pair_tier.size(); ++p)
+        pair_tier[p] = (work_tier[p] == 2) ? 2 : 0;
 
     // Early streaming partition: needed before temp buffer sizing so that
     // separated pairs can be routed to d_output (skipping temp buffer).
-    bool early_can_stream = dispatch_config.transpose_buf_cap > 0
-                            && !plan.work.large.empty();
-
     std::vector<size_t> separated_pair_indices;
-    if (early_can_stream) {
-        plan.staging_classified = classify_cutlass_work(plan.work);
-        merge_small_queues(plan.staging_classified);
-        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
-            auto& qwork = plan.staging_classified.queues[qi];
-            if (qwork.empty()) continue;
-            auto qpart = partition_large_smart(
-                qwork, A_gpu, B_gpu, plan.accum_map,
-                dispatch_config.transpose_buf_cap);
-            compute_pair_separation(qpart, qwork, plan.accum_map);
-            if (!qpart.pair_separated.empty()) {
-                for (size_t li = 0; li < qwork.problems.size(); ++li) {
-                    if (qpart.pair_separated[li]) {
-                        size_t pi = static_cast<size_t>(qwork.problems[li].pair_idx);
-                        pair_tier[pi] = 0;
-                        separated_pair_indices.push_back(pi);
-                    }
-                }
-            }
-            plan.streaming.queue_partitions[qi] = std::move(qpart);
-        }
-    }
+    const bool early_can_stream = plan_streaming_separation(
+        plan, A_gpu, B_gpu, dispatch_config, pair_tier, separated_pair_indices);
+
+    // Direct-write eligibility, computed once (after streaming separation
+    // finalizes pair_tier) for both temp-offset assignment and the reduction
+    // plan — these previously each recomputed the same singleton scan.
+    const std::vector<uint8_t> is_direct =
+        compute_direct_write_eligibility(plan.accum_map, pair_tier);
 
     // Right-size temp buffer: only non-direct-write CUTLASS pairs need space.
-    const size_t np = static_cast<size_t>(plan.num_pairs);
-    const size_t nob = static_cast<size_t>(plan.accum_map.num_output_blocks);
-
-    // Mixed output blocks (both CUTLASS and volume pairs) are detected via
-    // h_ob_tier_flags (kOBHasLarge & kOBHasMedium), computed in AccumulationMap.
-
-    std::vector<int64_t> tb_count(nob, 0);
-    for (size_t p = 0; p < np; ++p) {
-        if (pair_tier[p] != 0)
-            tb_count[static_cast<size_t>(
-                plan.accum_map.h_pair_output_block_idx[p])]++;
-    }
-
-    std::vector<uint8_t> is_direct(np, 0);
-    for (int64_t ob = 0; ob < plan.accum_map.num_output_blocks; ++ob) {
-        if (tb_count[static_cast<size_t>(ob)] != 1) continue;
-        // Mixed blocks: CUTLASS must go through temp buffer, not direct-write
-        if ((plan.accum_map.h_ob_tier_flags[static_cast<size_t>(ob)] &
-             (kOBHasLarge | kOBHasMedium)) == (kOBHasLarge | kOBHasMedium))
-            continue;
-        const int64_t begin = plan.accum_map.h_output_pair_offsets[ob];
-        const int64_t end = plan.accum_map.h_output_pair_offsets[ob + 1];
-        for (int64_t i = begin; i < end; ++i) {
-            const int64_t pi = plan.accum_map.h_output_pair_indices[i];
-            if (pair_tier[static_cast<size_t>(pi)] != 0) {
-                is_direct[static_cast<size_t>(pi)] = 1;
-                break;
-            }
-        }
-    }
-
-    int64_t compact_offset = 0;
-    if (early_can_stream) {
-        // Streaming: reuse temp slots across batches for the same output block.
-        // Pairs in different (queue, batch) groups are serialized, so they can
-        // share a temp slot and accumulate via CUTLASS beta=1.
-
-        // Build pair_idx → (queue * 10000 + batch) concurrent-group key
-        std::unordered_map<size_t, int> pair_qb;
-        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
-            const auto& qwork = plan.staging_classified.queues[qi];
-            const auto& qpart = plan.streaming.queue_partitions[qi];
-            for (int bi = 0; bi < static_cast<int>(qpart.batches.size()); ++bi) {
-                int key = qi * 10000 + bi;
-                for (int li : qpart.batches[bi].problem_indices) {
-                    pair_qb[static_cast<size_t>(qwork.problems[li].pair_idx)] = key;
-                }
-            }
-        }
-
-        // Per output block: find max concurrent pairs, assign shared offsets
-        for (int64_t ob = 0; ob < plan.accum_map.num_output_blocks; ++ob) {
-            const int64_t begin = plan.accum_map.h_output_pair_offsets[ob];
-            const int64_t end = plan.accum_map.h_output_pair_offsets[ob + 1];
-
-            // Collect non-direct CUTLASS pairs for this output block
-            std::vector<size_t> ob_pairs;
-            for (int64_t i = begin; i < end; ++i) {
-                size_t pi = static_cast<size_t>(plan.accum_map.h_output_pair_indices[i]);
-                if (pair_tier[pi] != 0 && !is_direct[pi])
-                    ob_pairs.push_back(pi);
-            }
-            if (ob_pairs.empty()) continue;
-
-            int64_t volume = plan.pairs_host[ob_pairs[0]].output_volume;
-
-            // Count pairs per concurrent group; find max
-            std::unordered_map<int, int> group_count;
-            for (size_t pi : ob_pairs) {
-                auto it = pair_qb.find(pi);
-                int key = (it != pair_qb.end()) ? it->second : -1;
-                group_count[key]++;
-            }
-            int max_slots = 0;
-            for (const auto& [k, cnt] : group_count)
-                max_slots = std::max(max_slots, cnt);
-
-            // Assign offsets: pairs in same (queue, batch) get sequential slots
-            int64_t block_base = compact_offset;
-            compact_offset += static_cast<int64_t>(max_slots) * volume;
-
-            std::unordered_map<int, int> group_next_slot;
-            for (size_t pi : ob_pairs) {
-                auto it = pair_qb.find(pi);
-                int key = (it != pair_qb.end()) ? it->second : -1;
-                int slot = group_next_slot[key]++;
-                plan.pairs_host[pi].output_offset =
-                    block_base + static_cast<int64_t>(slot) * volume;
-            }
-        }
-    } else {
-        // Non-streaming: each pair gets a unique temp slot
-        for (size_t p = 0; p < np; ++p) {
-            if (pair_tier[p] != 0 && !is_direct[p]) {
-                plan.pairs_host[p].output_offset = compact_offset;
-                compact_offset += plan.pairs_host[p].output_volume;
-            }
-        }
-    }
-    plan.total_pair_output_size = compact_offset;
+    plan_temp_buffer_offsets(plan, pair_tier, is_direct, early_can_stream);
 
     // Reduction plan (host-side only; GPU upload deferred to pipeline_allocate)
-    plan.reduce_plan = build_reduction_plan(plan.accum_map, pair_tier,
-                                            plan.pairs_host.data(),
-                                            plan.accum_map.h_ob_tier_flags);
+    plan.reduce_plan = build_reduction_plan(plan.accum_map, pair_tier, is_direct,
+                                            plan.pairs_host.data());
     for (size_t pi : separated_pair_indices) {
         plan.reduce_plan.h_direct_write[pi] = 1;
     }
@@ -1757,7 +2176,17 @@ PipelineWorkspaceInfo pipeline_query_workspace(
             ws += align_up(B_elements * elem, ALIGN);
     }
 
-    info.workspace_bytes = ws;
+    // Output permute: the internal-order accumulator becomes a workspace
+    // buffer (the user-facing d_output holds the einsum-order result).
+    // Requires pipeline_prepare (trivial-shape info) to have run.
+    if (plan.output_permute_active())
+        ws += align_up(plan.accum_map.total_output_elements * elem, ALIGN);
+
+    // One-time slack for aligning an arbitrary workspace base: take() aligns
+    // the base to 256 bytes and charges the padding against the budget. CUDA
+    // allocations are already 256-aligned, so this only matters for
+    // sub-allocated (offset) bases — but exact sizing must work for any base.
+    info.workspace_bytes = ws > 0 ? ws + ALIGN - 1 : 0;
     return info;
 }
 
@@ -1807,10 +2236,6 @@ LargeBlockWork<T> build_streaming_batch_work(
             bw.ptr_A.push_back(A_base + A_off + b * A_batch_stride);
             bw.ptr_B.push_back(B_base + B_off + b * B_batch_stride);
             bw.ptr_C.push_back(queue_work.ptr_C[es + b]);
-            bw.lda.push_back(prob.lda);
-            bw.ldb.push_back(prob.ldb);
-            bw.ldc.push_back(prob.ldc);
-            bw.ldd.push_back(prob.ldc);
         }
     }
     bw.num_gemm_problems = static_cast<int64_t>(bw.ptr_A.size());
@@ -1821,24 +2246,32 @@ LargeBlockWork<T> build_streaming_batch_work(
 // Phase 2: Address-independent shape/geometry build. No GPU pointers needed.
 // Builds shapes, dedup, tile selection, hypertile index — everything that
 // can be reused across GPU buffer reallocations.
+// Returns false on failure (reported via pipeline_error); prepare_done is set
+// only on success, so a failed prepare is caught again by pipeline_allocate.
 // ============================================================================
 template <typename T>
-void pipeline_prepare(
+bool pipeline_prepare(
     PipelinePlan<T>& plan,
     const GPUSparseInput<T>& A_gpu,
     const GPUSparseInput<T>& B_gpu)
 {
-    if (plan.num_pairs == 0) return;
+    if (plan.num_pairs == 0) {
+        plan.prepare_done = true;
+        return true;
+    }
 
     // Small tier: shape geometry + warp prefix
-    if (!plan.work.small.empty())
-        prepare_small_shapes(plan, A_gpu, B_gpu);
+    if (!plan.work.small.empty()) {
+        if (!prepare_small_shapes(plan, A_gpu, B_gpu))
+            return false;  // rank overflow already reported via pipeline_error
+    }
 
     // Medium tier: VolumeShape + divmod
     if (!plan.work.medium.empty()) {
         if (!prepare_medium_shapes(plan, A_gpu, B_gpu)) {
-            std::cerr << "pipeline_prepare: prepare_medium_shapes failed "
-                         "(partitioner should guarantee volume eligibility)\n";
+            return pipeline_error(
+                "pipeline_prepare: prepare_medium_shapes failed "
+                "(internal: partitioner rank-eligibility should prevent this)");
         }
     }
 
@@ -1848,14 +2281,14 @@ void pipeline_prepare(
             plan.nonstream_classified = classify_cutlass_work(plan.work);
             for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
                 if (plan.nonstream_classified.queues[qi].empty()) continue;
-                plan.nonstream_tiles[qi] = best_tile_for_queue(
+                plan.nonstream_kernels[qi] = best_kernel_for_queue(
                     plan.nonstream_classified.queues[qi]);
             }
         } else {
             // Streaming: compute tiles from staging_classified (built in pipeline_plan)
             for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
                 if (plan.staging_classified.queues[qi].empty()) continue;
-                plan.streaming.queue_tiles[qi] = best_tile_for_queue(
+                plan.streaming.queue_kernels[qi] = best_kernel_for_queue(
                     plan.staging_classified.queues[qi]);
             }
         }
@@ -1867,11 +2300,19 @@ void pipeline_prepare(
             plan.layout_plan.plan_A.dispatch_kind == TransposeDispatchKind::GenericPermute) {
             plan.hypertile_index_A = build_hypertile_index<T>(
                 A_gpu, plan.layout_plan.plan_A, plan.shape_map_A);
+            if (plan.hypertile_index_A.rank_overflow)
+                return pipeline_error(
+                    "pipeline_prepare: A transpose shape exceeds HT_MAX_RANK "
+                    "(layout not representable by the hypertile kernel)");
         }
         if (plan.layout_plan.plan_B.transpose &&
             plan.layout_plan.plan_B.dispatch_kind == TransposeDispatchKind::GenericPermute) {
             plan.hypertile_index_B = build_hypertile_index<T>(
                 B_gpu, plan.layout_plan.plan_B, plan.shape_map_B);
+            if (plan.hypertile_index_B.rank_overflow)
+                return pipeline_error(
+                    "pipeline_prepare: B transpose shape exceeds HT_MAX_RANK "
+                    "(layout not representable by the hypertile kernel)");
         }
         if (plan.layout_plan.plan_A.transpose) {
             plan.trivial_shapes_A = compute_trivial_shapes(
@@ -1884,12 +2325,508 @@ void pipeline_prepare(
                 plan.hypertile_index_B.valid ? &plan.hypertile_index_B : nullptr);
         }
     }
+
+    // Output permute: shape dedup + hypertile index over output blocks.
+    // Block dims (internal order) come from the section sizes of the source
+    // dims at each block coordinate.
+    if (plan.output_permute_needed) {
+        const auto& am = plan.accum_map;
+        const int32_t rank = am.output_rank;
+        const auto& config = plan.config;
+
+        auto section_size = [](const auto& gpu, int32_t dim_pos, int32_t blk) {
+            return gpu.block_sizes_flat[gpu.block_sizes_offsets[dim_pos] + blk];
+        };
+
+        std::vector<dim_t> out_dims(
+            static_cast<size_t>(am.num_output_blocks) * rank);
+        for (int64_t b = 0; b < am.num_output_blocks; ++b) {
+            const int32_t* coord = &am.h_output_block_coords[b * rank];
+            dim_t* dims = &out_dims[static_cast<size_t>(b) * rank];
+            int32_t pos = 0;
+            for (int32_t i = 0; i < config.num_batch; ++i, ++pos)
+                dims[pos] = section_size(A_gpu, config.batch_pos_A[i], coord[pos]);
+            for (int32_t i = 0; i < config.num_free_A; ++i, ++pos)
+                dims[pos] = section_size(A_gpu, config.free_pos_A[i], coord[pos]);
+            for (int32_t i = 0; i < config.num_free_B; ++i, ++pos)
+                dims[pos] = section_size(B_gpu, config.free_pos_B[i], coord[pos]);
+        }
+
+        plan.shape_map_out = build_block_shape_map(
+            out_dims.data(), static_cast<int>(am.num_output_blocks), rank);
+        plan.hypertile_index_out = build_hypertile_index_perm(
+            plan.shape_map_out, rank, config.internal_to_output);
+        if (plan.hypertile_index_out.rank_overflow)
+            return pipeline_error(
+                "pipeline_prepare: output permute exceeds HT_MAX_RANK "
+                "(einsum output layout not representable by the hypertile kernel)");
+        plan.trivial_shapes_out = compute_trivial_shapes(
+            plan.shape_map_out,
+            plan.hypertile_index_out.valid ? &plan.hypertile_index_out : nullptr);
+
+        // All-trivial: the permuted buffer would be bit-identical to the
+        // internal one (only size-1 dims move) — no stage, no extra buffer.
+        // Mixed: trivial blocks are covered by a full-buffer device copy
+        // before the permute kernel overwrites the non-trivial regions
+        // (rare; avoids a per-block copy kernel).
+        bool all_trivial = true, any_trivial = false;
+        for (uint8_t t : plan.trivial_shapes_out) {
+            if (t) any_trivial = true; else all_trivial = false;
+        }
+        plan.output_permute_all_trivial = all_trivial;
+        plan.output_permute_copy_first = !all_trivial && any_trivial;
+    }
+
+    // Set only on success: pipeline_allocate rejects plans where preparation
+    // was skipped OR failed partway.
+    plan.prepare_done = true;
+    return true;
+}
+
+// Bump allocator over a user-provided workspace (256-byte aligned).
+// When no workspace is provided, take() returns nullptr and callers
+// self-allocate via malloc_device_cached. A workspace smaller than
+// pipeline_query_workspace() reported is a caller error: take() throws
+// rather than handing out out-of-bounds device pointers.
+struct WorkspaceBump {
+    void* ws = nullptr;
+    int64_t bytes = 0;
+
+    bool provided() const { return ws != nullptr; }
+
+    void* take(int64_t n) {
+        if (!ws) return nullptr;
+        constexpr uintptr_t ALIGN = 256;
+        uintptr_t p = reinterpret_cast<uintptr_t>(ws);
+        p = (p + ALIGN - 1) & ~(ALIGN - 1);
+        int64_t used = static_cast<int64_t>(p - reinterpret_cast<uintptr_t>(ws)) + n;
+        if (used > bytes)
+            throw std::runtime_error(
+                "pipeline_allocate: user workspace too small "
+                "(size it with pipeline_query_workspace)");
+        void* result = reinterpret_cast<void*>(p);
+        ws = reinterpret_cast<void*>(p + n);
+        bytes -= used;
+        return result;
+    }
+};
+
+// --- pipeline_allocate step: bind or allocate d_output + temp buffer --------
+template <typename T>
+void allocate_bind_output(PipelinePlan<T>& plan, T* d_output,
+                          WorkspaceBump& ws, bool initialize_accumulators) {
+    constexpr int64_t elem = static_cast<int64_t>(sizeof(T));
+    const int64_t output_bytes = plan.accum_map.total_output_elements * elem;
+
+    if (plan.output_permute_active()) {
+        // User-facing buffer holds the einsum-order result; the contraction
+        // accumulates into an internal-order buffer that becomes workspace.
+        if (d_output) {
+            plan.d_output_final = d_output;
+            plan.owns_output_final = false;
+        } else {
+            check_cuda(malloc_device_cached(
+                           reinterpret_cast<void**>(&plan.d_output_final),
+                           output_bytes),
+                       "malloc final_output");
+            plan.owns_output_final = true;
+        }
+        if (ws.provided()) {
+            plan.d_output = static_cast<T*>(ws.take(output_bytes));
+            plan.owns_output = false;
+        } else {
+            check_cuda(malloc_device_cached(
+                           reinterpret_cast<void**>(&plan.d_output), output_bytes),
+                       "malloc internal_output");
+            plan.owns_output = true;
+        }
+    } else if (d_output) {
+        plan.d_output = d_output;
+        plan.owns_output = false;
+    } else {
+        check_cuda(malloc_device_cached(reinterpret_cast<void**>(&plan.d_output),
+                                        output_bytes),
+                   "malloc final_output");
+        plan.owns_output = true;
+    }
+
+    // output_beta != 0 with an active permute is rejected in pipeline_plan,
+    // so the internal accumulator is always zeroed when the permute runs.
+    if (plan.output_beta == 0 && initialize_accumulators) {
+        check_cuda(cudaMemset(plan.d_output, 0, output_bytes), "memset final_output");
+    }
+
+    plan.owns_workspace = !ws.provided();
+
+    // Temp buffer
+    if (plan.total_pair_output_size > 0) {
+        int64_t temp_bytes = plan.total_pair_output_size * elem;
+        if (ws.provided()) {
+            plan.d_temp_buffer = static_cast<T*>(ws.take(temp_bytes));
+        } else {
+            check_cuda(malloc_device_cached(
+                           reinterpret_cast<void**>(&plan.d_temp_buffer), temp_bytes),
+                       "malloc temp_buffer");
+        }
+        if (initialize_accumulators)
+            check_cuda(cudaMemset(plan.d_temp_buffer, 0, temp_bytes),
+                       "memset temp_buffer");
+    }
+}
+
+// --- pipeline_allocate step: patch GPU pointers into all three tiers --------
+// Large tier needs d_output + d_temp_buffer bound first; non-streaming large
+// work also builds its CUTLASS runners here.
+template <typename T>
+bool allocate_patch_pointers(PipelinePlan<T>& plan,
+                             const DeviceSparseInput<T>& A_dev,
+                             const DeviceSparseInput<T>& B_dev) {
+    if (!plan.work.large.empty() && !plan.streaming.enabled) {
+        // Bind pointers directly into the pre-classified queues, build runners.
+        // (Streaming queues are bound in allocate_setup_streaming.)
+        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
+            auto& qwork = plan.nonstream_classified.queues[qi];
+            if (qwork.empty()) continue;
+            bind_queue_pointers(qwork, plan.pairs_host,
+                A_dev.d_values, B_dev.d_values, plan.d_temp_buffer,
+                plan.d_output, plan.accum_map.h_dest_offsets,
+                plan.reduce_plan.h_direct_write);
+            plan.nonstream_runners[qi] = prepare_large_gemm_dispatch(
+                qwork, T(1), T(1), plan.nonstream_kernels[qi], plan.stream_large);
+        }
+    }
+
+    if (!plan.work.small.empty())
+        bind_small_mems(plan, A_dev, B_dev);
+
+    if (!plan.work.medium.empty()) {
+        if (!bind_medium_mems(plan, A_dev, B_dev))
+            return pipeline_error("pipeline_allocate: bind_medium_mems failed");
+    }
+    return true;
+}
+
+// Precompute the first ≤2 streaming batches: fill CUTLASS args (+ transpose
+// metadata) during setup so execute is pure kernel launches. Cases with >2
+// batches fall through to the runtime double-buffer path.
+// assemble_meta=true assembles + uploads hypertile metadata into precomp_bufs
+// (first bind). pipeline_rebind passes false: the metadata is offset-based
+// (base pointers are supplied at kernel launch) and stays valid — only the
+// CUTLASS args hold absolute pointers and need re-staging.
+template <typename T>
+void fill_precomputed_streaming_batches(PipelinePlan<T>& plan,
+                                        const GPUSparseInput<T>& A_gpu,
+                                        const GPUSparseInput<T>& B_gpu,
+                                        const DeviceSparseInput<T>& A_dev,
+                                        const DeviceSparseInput<T>& B_dev,
+                                        bool assemble_meta) {
+    int total_streaming_batches = 0;
+    for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi)
+        for (const auto& b : plan.streaming.queue_partitions[qi].batches)
+            if (!b.problem_indices.empty()) ++total_streaming_batches;
+
+    if (total_streaming_batches > 2) return;
+
+    int gslot = 0;
+    for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
+        const auto& partition = plan.streaming.queue_partitions[qi];
+        const auto& qlarge = plan.streaming.queue_work[qi];
+        KernelChoice kernel = plan.streaming.queue_kernels[qi];
+        if (partition.batches.empty() || qlarge.empty()) continue;
+
+        std::vector<int64_t> expanded_start(qlarge.problems.size());
+        int64_t eidx = 0;
+        for (size_t j = 0; j < qlarge.problems.size(); ++j) {
+            expanded_start[j] = eidx;
+            eidx += qlarge.problems[j].batch_size;
+        }
+
+        for (size_t bi = 0; bi < partition.batches.size(); ++bi) {
+            const auto& batch = partition.batches[bi];
+            if (batch.problem_indices.empty()) continue;
+
+            int slot = gslot;
+            T* d_buf = plan.streaming.d_buf[slot];
+
+            if (assemble_meta) {
+                TransposeFlatMeta meta_A, meta_B;
+                if (plan.layout_plan.plan_A.transpose) {
+                    meta_A = assemble_hypertile_batch(
+                        batch.unique_blocks_A,
+                        A_gpu.block_offsets.data(), A_gpu.block_volumes.data(),
+                        plan.shape_map_A,
+                        plan.hypertile_index_A, plan.trivial_shapes_A,
+                        batch.pack_offset_A,
+                        &plan.streaming.precomp_bufs[slot][0], 0);
+                }
+                if (plan.layout_plan.plan_B.transpose) {
+                    meta_B = assemble_hypertile_batch(
+                        batch.unique_blocks_B,
+                        B_gpu.block_offsets.data(), B_gpu.block_volumes.data(),
+                        plan.shape_map_B,
+                        plan.hypertile_index_B, plan.trivial_shapes_B,
+                        batch.pack_offset_B,
+                        &plan.streaming.precomp_bufs[slot][1], 0);
+                }
+                plan.streaming.precomp_meta[slot][0] = meta_A;
+                plan.streaming.precomp_meta[slot][1] = meta_B;
+            }
+
+            auto batch_work = build_streaming_batch_work(
+                plan, qlarge, batch, expanded_start,
+                plan.streaming.precomp_meta[slot][0],
+                plan.streaming.precomp_meta[slot][1], d_buf,
+                A_dev.d_values, B_dev.d_values);
+
+            fill_large_args_dispatch(
+                plan.streaming.args[slot], batch_work,
+                T(1), T(1), kernel, 0);
+
+            ++gslot;
+        }
+    }
+    plan.streaming.num_precomp = gslot;
+    plan.streaming.precomputed = true;
+}
+
+// --- pipeline_allocate step: streaming buffers, streams, precompute ---------
+// Moves staged classification into the streaming queues, allocates the
+// double-buffered transpose workspace + CUTLASS arg buffers, and precomputes
+// the first ≤2 batches so execute is pure kernel launches.
+template <typename T>
+void allocate_setup_streaming(PipelinePlan<T>& plan,
+                              const GPUSparseInput<T>& A_gpu,
+                              const GPUSparseInput<T>& B_gpu,
+                              const DeviceSparseInput<T>& A_dev,
+                              const DeviceSparseInput<T>& B_dev,
+                              WorkspaceBump& ws) {
+    constexpr int64_t elem = static_cast<int64_t>(sizeof(T));
+
+    // Bind pointer arrays per queue, move staging → streaming queue_work
+    for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
+        auto& q = plan.staging_classified.queues[qi];
+        if (!q.empty())
+            bind_queue_pointers(q, plan.pairs_host,
+                A_dev.d_values, B_dev.d_values, plan.d_temp_buffer,
+                plan.d_output, plan.accum_map.h_dest_offsets,
+                plan.reduce_plan.h_direct_write);
+        plan.streaming.queue_work[qi] = std::move(q);
+        // tiles already set in pipeline_prepare
+    }
+    plan.staging_classified = ShapeClassifiedWork<T>{};
+
+    // Allocate or bind streaming transpose buffers (only when transpose needed)
+    if (plan.needs_transpose && plan.streaming.buf_cap > 0) {
+        int64_t buf_bytes = plan.streaming.buf_cap * elem;
+        int total_batches = 0;
+        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi)
+            total_batches += static_cast<int>(plan.streaming.queue_partitions[qi].batches.size());
+        int num_bufs = (total_batches <= 1) ? 1 : 2;
+        for (int b = 0; b < num_bufs; ++b) {
+            if (ws.provided()) {
+                plan.streaming.d_buf[b] = static_cast<T*>(ws.take(buf_bytes));
+            } else {
+                check_cuda(malloc_device_cached(
+                               reinterpret_cast<void**>(&plan.streaming.d_buf[b]),
+                               buf_bytes),
+                           "malloc streaming transpose buffer");
+            }
+        }
+    }
+
+    // Streaming streams + events from the shared context
+    {
+        auto& sctx = get_stream_context();
+        for (int i = 0; i < 2; ++i) {
+            plan.streaming.streams[i] = sctx.streaming_streams[i];
+            plan.streaming.gemm_done[i] = sctx.gemm_done[i];
+            plan.streaming.copy_done[i] = sctx.copy_done[i];
+        }
+    }
+
+    // Pre-allocate CUTLASS arg buffers (shared by precomputed + runtime paths)
+    if (plan.streaming.max_expanded_problems > 0) {
+        plan.streaming.args[0] = allocate_cutlass_args(
+            static_cast<int>(plan.streaming.max_expanded_problems));
+        plan.streaming.args[1] = allocate_cutlass_args(
+            static_cast<int>(plan.streaming.max_expanded_problems));
+    }
+
+    // Pre-allocate transpose descriptor buffers (only when transpose needed)
+    if (plan.needs_transpose) {
+        for (int slot = 0; slot < 2; ++slot) {
+            if (plan.layout_plan.plan_A.transpose)
+                plan.streaming.precomp_bufs[slot][0].allocate(A_gpu.num_blocks);
+            if (plan.layout_plan.plan_B.transpose)
+                plan.streaming.precomp_bufs[slot][1].allocate(B_gpu.num_blocks);
+        }
+    }
+
+    fill_precomputed_streaming_batches(plan, A_gpu, B_gpu, A_dev, B_dev,
+                                       /*assemble_meta=*/true);
+}
+
+// --- pipeline_allocate step: non-streaming transpose workspace --------------
+// Assembles the full-tensor transpose batch and allocates a workspace per
+// operand that needs it (hypertile_index + trivial_shapes already built in
+// pipeline_prepare).
+template <typename T>
+void allocate_setup_transpose(PipelinePlan<T>& plan,
+                              const GPUSparseInput<T>& A_gpu,
+                              const GPUSparseInput<T>& B_gpu,
+                              const DeviceSparseInput<T>& A_dev,
+                              const DeviceSparseInput<T>& B_dev,
+                              WorkspaceBump& ws) {
+    constexpr int64_t elem = static_cast<int64_t>(sizeof(T));
+
+    auto build_transpose = [&](const GPUSparseInput<T>& gpu, const auto& op_plan,
+                               const BlockShapeMap& smap,
+                               const HypertileIndex& idx,
+                               const std::vector<uint8_t>& trivial_shapes,
+                               TransposeFlatMeta& precomp, T*& d_workspace,
+                               int64_t total_elements) {
+        if (!op_plan.transpose) return;
+        std::vector<int> all_blocks(gpu.num_blocks);
+        std::iota(all_blocks.begin(), all_blocks.end(), 0);
+        precomp = assemble_hypertile_batch(
+            all_blocks, gpu.block_offsets.data(), gpu.block_volumes.data(),
+            smap, idx, trivial_shapes,
+            {}, nullptr, plan.stream_large);
+        if (precomp.kind != TransposeDispatchKind::None) {
+            int64_t ws_bytes = total_elements * elem;
+            if (ws.provided()) {
+                d_workspace = static_cast<T*>(ws.take(ws_bytes));
+            } else {
+                check_cuda(malloc_device_cached(
+                               reinterpret_cast<void**>(&d_workspace), ws_bytes),
+                           "malloc transpose workspace");
+            }
+        }
+    };
+    build_transpose(A_gpu, plan.layout_plan.plan_A, plan.shape_map_A,
+                  plan.hypertile_index_A, plan.trivial_shapes_A,
+                  plan.transpose_precomp_A,
+                  plan.tv.d_workspace_A, A_dev.total_elements);
+    build_transpose(B_gpu, plan.layout_plan.plan_B, plan.shape_map_B,
+                  plan.hypertile_index_B, plan.trivial_shapes_B,
+                  plan.transpose_precomp_B,
+                  plan.tv.d_workspace_B, B_dev.total_elements);
+}
+
+// --- pipeline_allocate step: output permute metadata -------------------------
+// Assembles the full-output hypertile batch once; execute only launches.
+// Source and destination use the same block offsets (volumes are
+// permutation-invariant), so no pack_offset is needed.
+template <typename T>
+void allocate_setup_output_permute(PipelinePlan<T>& plan) {
+    if (!plan.output_permute_active()) return;
+    const auto& am = plan.accum_map;
+    std::vector<int> all_blocks(static_cast<size_t>(am.num_output_blocks));
+    std::iota(all_blocks.begin(), all_blocks.end(), 0);
+    plan.output_permute_meta = assemble_hypertile_batch(
+        all_blocks, am.h_output_block_offsets, am.h_output_block_volumes,
+        plan.shape_map_out, plan.hypertile_index_out, plan.trivial_shapes_out,
+        {}, nullptr, plan.stream_large);
 }
 
 // ============================================================================
 // Phase 3: Bind workspace buffers, patch GPU pointers, upload to device.
 // If d_output/workspace are null, self-allocates (backward-compat behavior).
+//
+// `initialize_accumulators` must be true for any plan that will be executed:
+// every GEMM tier accumulates with beta=1, so an unzeroed d_output /
+// d_temp_buffer produces garbage.  Pass false ONLY to isolate the host
+// planning cost from the device zero-fill in benchmarks (which then perform
+// the equivalent memsets themselves); the 8-argument overload below defaults
+// it to true.
 // ============================================================================
+template <typename T>
+bool pipeline_allocate(
+    PipelinePlan<T>& plan,
+    const GPUSparseInput<T>& A_gpu,
+    const GPUSparseInput<T>& B_gpu,
+    const DeviceSparseInput<T>& A_dev,
+    const DeviceSparseInput<T>& B_dev,
+    T* d_output,
+    void* workspace,
+    int64_t workspace_bytes,
+    bool initialize_accumulators)
+{
+    if (plan.num_pairs == 0) return true;
+    if (!plan.prepare_done)
+        return pipeline_error("pipeline_allocate: pipeline_prepare not called");
+
+    // Snapshot free memory before allocations for accurate peak measurement
+    size_t free_before = 0, total_ignore = 0;
+    cudaMemGetInfo(&free_before, &total_ignore);
+
+    using alloc_clock = std::chrono::high_resolution_clock;
+
+    // --- GPU uploads deferred from pipeline_plan ---
+    double bind_upload = 0, bind_patch = 0, bind_stream = 0;
+    auto tb0 = alloc_clock::now();
+    upload_reduction_plan(plan.reduce_plan);
+    bind_upload = detail_timing::ms_since(tb0);
+
+    {
+        auto& sctx = get_stream_context();
+        plan.stream_large = sctx.stream_large;
+        plan.stream_small = sctx.stream_small;
+        plan.stream_medium = sctx.stream_medium;
+        plan.transpose_done_flat = sctx.transpose_done_flat;
+        plan.transpose_done_tiled = sctx.transpose_done_tiled;
+    }
+
+    WorkspaceBump ws{workspace, workspace_bytes};
+
+    // The default preserves the API's fresh-execute semantics.  The benchmark
+    // disables initialization here, then zeros the exact same accumulator
+    // regions after the host-preparation endpoint so the two costs are visible.
+    allocate_bind_output(plan, d_output, ws, initialize_accumulators);
+    allocate_setup_output_permute(plan);
+
+    // Init transposed values
+    plan.tv.d_A = A_dev.d_values;
+    plan.tv.d_B = B_dev.d_values;
+    plan.tv.d_workspace_A = nullptr;
+    plan.tv.d_workspace_B = nullptr;
+    plan.tv.gemm_mode = GemmMode::NN;
+
+    // --- Patch GPU pointers into all tiers (needs d_output + d_temp_buffer) ---
+    auto tb1 = alloc_clock::now();
+    if (!allocate_patch_pointers(plan, A_dev, B_dev))
+        return false;
+    bind_patch = detail_timing::ms_since(tb1);
+
+    // --- Streaming / transpose workspace setup ---
+    auto tb2 = alloc_clock::now();
+    if (plan.streaming.enabled) {
+        allocate_setup_streaming(plan, A_gpu, B_gpu, A_dev, B_dev, ws);
+    } else if (plan.needs_transpose) {
+        allocate_setup_transpose(plan, A_gpu, B_gpu, A_dev, B_dev, ws);
+    }
+    bind_stream = detail_timing::ms_since(tb2);
+
+    // Measure actual pipeline allocation via cudaMemGetInfo delta
+    size_t free_after = 0;
+    cudaMemGetInfo(&free_after, &total_ignore);
+    plan.measured_alloc_bytes = static_cast<int64_t>(free_before - free_after);
+
+    if (plan.timing) {
+        plan.timing->bind_upload_ms = bind_upload;
+        plan.timing->bind_patch_ms = bind_patch;
+        plan.timing->bind_stream_ms = bind_stream;
+        plan.timing->bind_ms = bind_upload + bind_patch + bind_stream;
+    }
+
+    cudaDeviceSynchronize();
+    plan.allocate_done = true;
+    return true;
+}
+
+// Source- and ABI-compatible public entry point.  Normal callers always get
+// fresh accumulator initialization; the overload above exists so timing tools
+// can expose that device work separately without changing execution semantics.
 template <typename T>
 bool pipeline_allocate(
     PipelinePlan<T>& plan,
@@ -1901,285 +2838,130 @@ bool pipeline_allocate(
     void* workspace = nullptr,
     int64_t workspace_bytes = 0)
 {
+    return pipeline_allocate(plan, A_gpu, B_gpu, A_dev, B_dev,
+                             d_output, workspace, workspace_bytes,
+                             /*initialize_accumulators=*/true);
+}
+
+// ============================================================================
+// Re-zero the accumulator for a repeated pipeline_execute with unchanged
+// pointers (output_beta == 0 semantics). The temp buffer needs no reset — the
+// reduce kernel restores its slots to zero after reading them.
+// ============================================================================
+template <typename T>
+void pipeline_reset_output(PipelinePlan<T>& plan) {
+    if (plan.num_pairs == 0 || plan.output_beta != 0) return;
+    const int64_t output_bytes =
+        plan.accum_map.total_output_elements * static_cast<int64_t>(sizeof(T));
+    check_cuda(cudaMemset(plan.d_output, 0, output_bytes),
+               "pipeline_reset_output memset");
+}
+
+// ============================================================================
+// Rebind an allocated plan to new device base pointers (same metadata).
+// Re-runs only the pointer-staging work: everything metadata-derived (pair
+// matching, tiers, accum map, hypertile indexes, reduction plan, streams,
+// uploaded shapes) is reused from the first pipeline_allocate. Buffers the
+// plan self-allocated on the first bind (null d_output/workspace) are kept;
+// caller-provided ones are re-carved from the new workspace in the same
+// order as pipeline_allocate, so offsets match the original layout.
+// Also re-zeroes the accumulator (output_beta == 0), so a rebind is always
+// followed by a correct fresh execute.
+// ============================================================================
+template <typename T>
+bool pipeline_rebind(
+    PipelinePlan<T>& plan,
+    const GPUSparseInput<T>& A_gpu,
+    const GPUSparseInput<T>& B_gpu,
+    const DeviceSparseInput<T>& A_dev,
+    const DeviceSparseInput<T>& B_dev,
+    T* d_output = nullptr,
+    void* workspace = nullptr,
+    int64_t workspace_bytes = 0)
+{
     if (plan.num_pairs == 0) return true;
-
-    // Snapshot free memory before allocations for accurate peak measurement
-    size_t free_before = 0, total_ignore = 0;
-    cudaMemGetInfo(&free_before, &total_ignore);
-
-    using alloc_clock = std::chrono::high_resolution_clock;
-    double bind_accum = 0;
-
-    // --- GPU uploads deferred from pipeline_plan ---
-    double bind_upload = 0, bind_patch = 0, bind_stream = 0;
-    auto tb0 = alloc_clock::now();
-    upload_accumulation_map(plan.accum_map);
-    upload_reduction_plan(plan.reduce_plan);
-    bind_upload = detail_timing::ms_since(tb0);
-
-    check_cuda(cudaStreamCreate(&plan.stream_large), "create stream_large");
-    check_cuda(cudaStreamCreate(&plan.stream_small), "create stream_small");
-    check_cuda(cudaStreamCreate(&plan.stream_medium), "create stream_medium");
-    check_cuda(cudaEventCreateWithFlags(&plan.transpose_done_flat, cudaEventDisableTiming),
-               "create transpose_done_flat");
-    check_cuda(cudaEventCreateWithFlags(&plan.transpose_done_tiled, cudaEventDisableTiming),
-               "create transpose_done_tiled");
+    if (!plan.allocate_done)
+        return pipeline_error("pipeline_rebind: pipeline_allocate not called");
 
     constexpr int64_t elem = static_cast<int64_t>(sizeof(T));
-    constexpr int64_t ALIGN = 256;
+    const int64_t output_bytes = plan.accum_map.total_output_elements * elem;
+    WorkspaceBump ws{workspace, workspace_bytes};
 
-    // --- Bind or allocate d_output ---
-    if (d_output) {
-        plan.d_output = d_output;
-        plan.owns_output = false;
-    } else {
-        check_cuda(cudaMalloc(&plan.d_output, plan.accum_map.total_output_elements * elem),
-                   "malloc final_output");
-        plan.owns_output = true;
-    }
-
-    if (plan.output_beta == 0) {
-        check_cuda(cudaMemset(plan.d_output, 0,
-                   plan.accum_map.total_output_elements * elem), "memset final_output");
-    }
-
-    // --- Sub-allocate workspace or self-allocate ---
-    auto bump = [&](int64_t bytes) -> void* {
-        if (!workspace) return nullptr;
-        uintptr_t p = reinterpret_cast<uintptr_t>(workspace);
-        p = (p + ALIGN - 1) & ~static_cast<uintptr_t>(ALIGN - 1);
-        void* result = reinterpret_cast<void*>(p);
-        int64_t used = static_cast<int64_t>(p - reinterpret_cast<uintptr_t>(workspace)) + bytes;
-        workspace = reinterpret_cast<void*>(p + bytes);
-        workspace_bytes -= used;
-        return result;
-    };
-
-    plan.owns_workspace = (workspace == nullptr);
-
-    // Temp buffer
-    if (plan.total_pair_output_size > 0) {
-        int64_t temp_bytes = plan.total_pair_output_size * elem;
-        if (workspace) {
-            plan.d_temp_buffer = static_cast<T*>(bump(temp_bytes));
-        } else {
-            check_cuda(cudaMalloc(&plan.d_temp_buffer, temp_bytes), "malloc temp_buffer");
+    // --- Output buffers (same carve order as allocate_bind_output) ---
+    if (plan.output_permute_active()) {
+        if (!plan.owns_output_final) {
+            if (!d_output)
+                return pipeline_error(
+                    "pipeline_rebind: plan was bound to a user output buffer");
+            plan.d_output_final = d_output;
         }
-        check_cuda(cudaMemset(plan.d_temp_buffer, 0, temp_bytes), "memset temp_buffer");
+        if (!plan.owns_output)
+            plan.d_output = static_cast<T*>(ws.take(output_bytes));
+    } else if (!plan.owns_output) {
+        if (!d_output)
+            return pipeline_error(
+                "pipeline_rebind: plan was bound to a user output buffer");
+        plan.d_output = d_output;
+    }
+    if (plan.output_beta == 0)
+        check_cuda(cudaMemset(plan.d_output, 0, output_bytes),
+                   "rebind memset output");
+
+    // --- Temp buffer: re-carve when user-provided; must be re-zeroed (the
+    // reduce-kernel invariant only holds within one buffer's lifetime) ---
+    if (plan.total_pair_output_size > 0) {
+        const int64_t temp_bytes = plan.total_pair_output_size * elem;
+        if (!plan.owns_workspace)
+            plan.d_temp_buffer = static_cast<T*>(ws.take(temp_bytes));
+        check_cuda(cudaMemset(plan.d_temp_buffer, 0, temp_bytes),
+                   "rebind memset temp");
     }
 
-    // Init transposed values
+    // --- Re-stage absolute pointers into all tiers ---
+    if (!allocate_patch_pointers(plan, A_dev, B_dev))
+        return false;
+
+    if (plan.streaming.enabled) {
+        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
+            auto& q = plan.streaming.queue_work[qi];
+            if (!q.empty())
+                bind_queue_pointers(q, plan.pairs_host,
+                    A_dev.d_values, B_dev.d_values, plan.d_temp_buffer,
+                    plan.d_output, plan.accum_map.h_dest_offsets,
+                    plan.reduce_plan.h_direct_write);
+        }
+        // Streaming transpose buffers follow owns_workspace (same carve
+        // order/count as allocate_setup_streaming).
+        if (!plan.owns_workspace && plan.needs_transpose &&
+            plan.streaming.buf_cap > 0) {
+            const int64_t buf_bytes = plan.streaming.buf_cap * elem;
+            const int num_bufs = plan.streaming.d_buf[1] ? 2 : 1;
+            for (int b = 0; b < num_bufs; ++b)
+                plan.streaming.d_buf[b] = static_cast<T*>(ws.take(buf_bytes));
+        }
+        // Precomputed fast path bakes absolute pointers into CUTLASS args —
+        // re-fill them, reusing the offset-based transpose metadata.
+        if (plan.streaming.precomputed)
+            fill_precomputed_streaming_batches(plan, A_gpu, B_gpu,
+                                               A_dev, B_dev,
+                                               /*assemble_meta=*/false);
+    } else if (plan.needs_transpose) {
+        // Non-streaming transpose workspaces (carved in the same order as
+        // allocate_setup_transpose; metadata itself is offset-based).
+        if (!plan.owns_workspace) {
+            if (plan.tv.d_workspace_A)
+                plan.tv.d_workspace_A =
+                    static_cast<T*>(ws.take(A_dev.total_elements * elem));
+            if (plan.tv.d_workspace_B)
+                plan.tv.d_workspace_B =
+                    static_cast<T*>(ws.take(B_dev.total_elements * elem));
+        }
+    }
+
+    // Reset the transposed-values view so stage_transpose/stage_patch_pointers
+    // start from the new inputs.
     plan.tv.d_A = A_dev.d_values;
     plan.tv.d_B = B_dev.d_values;
-    plan.tv.d_workspace_A = nullptr;
-    plan.tv.d_workspace_B = nullptr;
-    plan.tv.gemm_mode = GemmMode::NN;
-
-    // --- Patch GPU pointers into large tier (needs d_output + d_temp_buffer) ---
-    auto tb1 = alloc_clock::now();
-    if (!plan.work.large.empty()) {
-        build_large_pointers(plan.work.large, plan.pairs_host,
-            A_dev.d_values, B_dev.d_values, plan.d_temp_buffer,
-            plan.d_output, plan.accum_map.h_dest_offsets,
-            plan.reduce_plan.h_direct_write);
-
-        if (!plan.streaming.enabled) {
-            // Distribute pointers into pre-classified queues, build CUTLASS runners
-            distribute_large_pointers(plan.nonstream_classified, plan.work.large);
-            for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
-                auto& qwork = plan.nonstream_classified.queues[qi];
-                if (qwork.empty()) continue;
-                plan.nonstream_runners[qi] = prepare_cutlass_gemm_dispatch(
-                    qwork, T(1), T(1), plan.nonstream_tiles[qi], plan.stream_large);
-            }
-        }
-    }
-
-    // --- Bind small/medium mems (patch GPU pointers + upload) ---
-    if (!plan.work.small.empty())
-        bind_small_mems(plan, A_dev, B_dev);
-
-    if (!plan.work.medium.empty()) {
-        if (!bind_medium_mems(plan, A_dev, B_dev)) {
-            std::cerr << "pipeline_allocate: bind_medium_mems failed\n";
-            return false;
-        }
-    }
-    bind_patch = detail_timing::ms_since(tb1);
-
-    // --- Streaming / transpose workspace setup ---
-    auto tb2 = alloc_clock::now();
-    if (plan.streaming.enabled) {
-        // Distribute pointer arrays, move staging → streaming queue_work
-        distribute_large_pointers(plan.staging_classified, plan.work.large);
-        for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
-            plan.streaming.queue_work[qi] = std::move(plan.staging_classified.queues[qi]);
-            // tiles already set in pipeline_prepare
-        }
-        plan.staging_classified = ShapeClassifiedWork<T>{};
-
-        // Allocate or bind streaming transpose buffers (only when transpose needed)
-        if (plan.needs_transpose && plan.streaming.buf_cap > 0) {
-            int64_t buf_bytes = plan.streaming.buf_cap * elem;
-            int total_batches = 0;
-            for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi)
-                total_batches += static_cast<int>(plan.streaming.queue_partitions[qi].batches.size());
-            int num_bufs = (total_batches <= 1) ? 1 : 2;
-            for (int b = 0; b < num_bufs; ++b) {
-                if (workspace) {
-                    plan.streaming.d_buf[b] = static_cast<T*>(bump(buf_bytes));
-                } else {
-                    check_cuda(cudaMalloc(&plan.streaming.d_buf[b], buf_bytes),
-                               "malloc streaming transpose buffer");
-                }
-            }
-        }
-
-        // Streaming streams + events
-        check_cuda(cudaStreamCreate(&plan.streaming.streams[0]), "create streaming stream 0");
-        check_cuda(cudaStreamCreate(&plan.streaming.streams[1]), "create streaming stream 1");
-        check_cuda(cudaEventCreateWithFlags(&plan.streaming.gemm_done[0], cudaEventDisableTiming),
-                   "create streaming event 0");
-        check_cuda(cudaEventCreateWithFlags(&plan.streaming.gemm_done[1], cudaEventDisableTiming),
-                   "create streaming event 1");
-        check_cuda(cudaEventCreateWithFlags(&plan.streaming.copy_done[0], cudaEventDisableTiming),
-                   "create streaming copy_done event 0");
-        check_cuda(cudaEventCreateWithFlags(&plan.streaming.copy_done[1], cudaEventDisableTiming),
-                   "create streaming copy_done event 1");
-
-        // Pre-allocate CUTLASS arg buffers (shared by precomputed + runtime paths)
-        if (plan.streaming.max_expanded_problems > 0) {
-            plan.streaming.args[0] = allocate_cutlass_args(
-                static_cast<int>(plan.streaming.max_expanded_problems));
-            plan.streaming.args[1] = allocate_cutlass_args(
-                static_cast<int>(plan.streaming.max_expanded_problems));
-        }
-
-        // Pre-allocate transpose descriptor buffers (only when transpose needed)
-        if (plan.needs_transpose) {
-            for (int slot = 0; slot < 2; ++slot) {
-                if (plan.layout_plan.plan_A.transpose)
-                    plan.streaming.precomp_bufs[slot][0].allocate(A_gpu.num_blocks);
-                if (plan.layout_plan.plan_B.transpose)
-                    plan.streaming.precomp_bufs[slot][1].allocate(B_gpu.num_blocks);
-            }
-        }
-
-        // Precompute first ≤2 batches: fill CUTLASS args + transpose metadata
-        // during setup so execute is pure kernel launches.
-        // Cases with >2 batches fall through to runtime double-buffer path.
-        {
-            int total_streaming_batches = 0;
-            for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi)
-                for (const auto& b : plan.streaming.queue_partitions[qi].batches)
-                    if (!b.problem_indices.empty()) ++total_streaming_batches;
-
-            if (total_streaming_batches <= 2) {
-                int gslot = 0;
-                for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
-                    const auto& partition = plan.streaming.queue_partitions[qi];
-                    const auto& qlarge = plan.streaming.queue_work[qi];
-                    TileShape tile = plan.streaming.queue_tiles[qi];
-                    if (partition.batches.empty() || qlarge.empty()) continue;
-
-                    std::vector<int64_t> expanded_start(qlarge.problems.size());
-                    int64_t eidx = 0;
-                    for (size_t j = 0; j < qlarge.problems.size(); ++j) {
-                        expanded_start[j] = eidx;
-                        eidx += qlarge.problems[j].batch_size;
-                    }
-
-                    for (size_t bi = 0; bi < partition.batches.size(); ++bi) {
-                        const auto& batch = partition.batches[bi];
-                        if (batch.problem_indices.empty()) continue;
-
-                        int slot = gslot;
-                        T* d_buf = plan.streaming.d_buf[slot];
-
-                        TransposeFlatMeta meta_A, meta_B;
-                        if (plan.layout_plan.plan_A.transpose) {
-                            meta_A = assemble_hypertile_batch<T>(
-                                batch.unique_blocks_A, A_gpu, plan.shape_map_A,
-                                plan.hypertile_index_A, plan.trivial_shapes_A,
-                                batch.pack_offset_A,
-                                &plan.streaming.precomp_bufs[slot][0], 0);
-                        }
-                        if (plan.layout_plan.plan_B.transpose) {
-                            meta_B = assemble_hypertile_batch<T>(
-                                batch.unique_blocks_B, B_gpu, plan.shape_map_B,
-                                plan.hypertile_index_B, plan.trivial_shapes_B,
-                                batch.pack_offset_B,
-                                &plan.streaming.precomp_bufs[slot][1], 0);
-                        }
-                        plan.streaming.precomp_meta[slot][0] = meta_A;
-                        plan.streaming.precomp_meta[slot][1] = meta_B;
-
-                        auto batch_work = build_streaming_batch_work(
-                            plan, qlarge, batch, expanded_start,
-                            meta_A, meta_B, d_buf,
-                            A_dev.d_values, B_dev.d_values);
-
-                        fill_cutlass_args_dispatch(
-                            plan.streaming.args[slot], batch_work,
-                            T(1), T(1), tile, 0);
-
-                        ++gslot;
-                    }
-                }
-                plan.streaming.num_precomp = gslot;
-                plan.streaming.precomputed = true;
-            }
-        }
-
-    } else if (plan.needs_transpose) {
-        // Non-streaming transpose: assemble transpose batch + workspace alloc
-        // (hypertile_index + trivial_shapes already built in pipeline_prepare)
-        auto build_transpose = [&](const GPUSparseInput<T>& gpu, const auto& op_plan,
-                                   const BlockShapeMap& smap,
-                                   const HypertileIndex& idx,
-                                   const std::vector<uint8_t>& trivial_shapes,
-                                   TransposeFlatMeta& precomp, T*& d_workspace,
-                                   int64_t total_elements) {
-            if (!op_plan.transpose) return;
-            std::vector<int> all_blocks(gpu.num_blocks);
-            std::iota(all_blocks.begin(), all_blocks.end(), 0);
-            precomp = assemble_hypertile_batch<T>(
-                all_blocks, gpu, smap, idx, trivial_shapes,
-                {}, nullptr, plan.stream_large);
-            if (precomp.kind != TransposeDispatchKind::None) {
-                int64_t ws_bytes = total_elements * elem;
-                if (workspace) {
-                    d_workspace = static_cast<T*>(bump(ws_bytes));
-                } else {
-                    check_cuda(cudaMalloc(&d_workspace, ws_bytes),
-                               "malloc transpose workspace");
-                }
-            }
-        };
-        build_transpose(A_gpu, plan.layout_plan.plan_A, plan.shape_map_A,
-                      plan.hypertile_index_A, plan.trivial_shapes_A,
-                      plan.transpose_precomp_A,
-                      plan.tv.d_workspace_A, A_dev.total_elements);
-        build_transpose(B_gpu, plan.layout_plan.plan_B, plan.shape_map_B,
-                      plan.hypertile_index_B, plan.trivial_shapes_B,
-                      plan.transpose_precomp_B,
-                      plan.tv.d_workspace_B, B_dev.total_elements);
-    }
-
-    bind_stream = detail_timing::ms_since(tb2);
-
-    // Measure actual pipeline allocation via cudaMemGetInfo delta
-    size_t free_after = 0;
-    cudaMemGetInfo(&free_after, &total_ignore);
-    plan.measured_alloc_bytes = static_cast<int64_t>(free_before - free_after);
-
-    if (plan.timing) {
-        populate_timing_stats(*plan.timing, plan, A_dev, B_dev, A_gpu, B_gpu);
-        plan.timing->bind_upload_ms = bind_upload;
-        plan.timing->bind_patch_ms = bind_patch;
-        plan.timing->bind_stream_ms = bind_stream;
-        plan.timing->bind_ms = bind_upload + bind_patch + bind_stream;
-    }
 
     cudaDeviceSynchronize();
     return true;
@@ -2209,11 +2991,19 @@ bool pipeline_setup(
         return false;
     if (timing) timing->plan_ms = detail_timing::ms_since(t0);
     auto t1 = clock::now();
-    pipeline_prepare(plan, A_gpu, B_gpu);
+    if (!pipeline_prepare(plan, A_gpu, B_gpu))
+        return false;
     if (timing) timing->prepare_ms = detail_timing::ms_since(t1);
     auto t2 = clock::now();
     bool ok = pipeline_allocate(plan, A_gpu, B_gpu, A_dev, B_dev);
     if (timing) timing->allocate_ms = detail_timing::ms_since(t2);
+    // Diagnostics AFTER the timing endpoints: populate_timing_stats rescans
+    // the per-tier problem vectors and block dims, which must not pollute the
+    // measured setup phases (CPU setup time is the tuning signal). It needs
+    // allocate-time state (measured_alloc_bytes, streaming metadata), so it
+    // cannot run earlier.
+    if (ok && timing)
+        populate_timing_stats(*timing, plan, A_dev, B_dev, A_gpu, B_gpu);
     return ok;
 }
 
@@ -2279,7 +3069,10 @@ void pipeline_execute(
     }
 
     if (timing) {
-        if (plan.total_warps > 0) timing->small_kernel_kind = "warp";
+        if (plan.total_warps > 0 && plan.small_num_dots > 0)
+            timing->small_kernel_kind = "warp+dot";
+        else if (plan.total_warps > 0) timing->small_kernel_kind = "warp";
+        else if (plan.small_num_dots > 0) timing->small_kernel_kind = "dot";
         else timing->small_kernel_kind = nullptr;
     }
 
@@ -2293,15 +3086,47 @@ void pipeline_execute(
     cudaDeviceSynchronize();
 
     if (timing) { timing->accumulation_ms = detail_timing::ms_since(t_stage); }
+
+    // --- Output permute: internal order → einsum output order ---
+    if (plan.output_permute_active()) {
+        t_stage = clock::now();
+        constexpr int64_t elem = static_cast<int64_t>(sizeof(T));
+        if (plan.output_permute_copy_first) {
+            // Trivial-shape blocks are not touched by the permute kernel;
+            // cover them with one full-buffer copy (rare mixed case).
+            check_cuda(cudaMemcpyAsync(
+                           plan.d_output_final, plan.d_output,
+                           plan.accum_map.total_output_elements * elem,
+                           cudaMemcpyDeviceToDevice, 0),
+                       "output permute pre-copy");
+        }
+        launch_batched_transpose<T>(plan.d_output, plan.d_output_final,
+                                    plan.output_permute_meta, 0);
+        cudaDeviceSynchronize();
+        if (timing) { timing->output_permute_ms = detail_timing::ms_since(t_stage); }
+    } else if (timing) {
+        timing->output_permute_ms = 0.0;
+    }
+
     if (timing) { timing->total_ms = detail_timing::ms_since(t_total); }
 }
 
+// Result contract: d_output holds packed blocks, each block row-major in
+// einsum output label order; output_block_coords are in that same order.
+// When the einsum order matches internal order (or the permutation moves no
+// data), the internal buffer is handed out directly.
 template <typename T>
 GeneralSparseResult<T> pipeline_extract_result(PipelinePlan<T>& plan) {
     GeneralSparseResult<T> result;
-    result.d_output = plan.d_output;
-    result.owns_output = plan.owns_output;
-    plan.d_output = nullptr;
+    if (plan.output_permute_active()) {
+        result.d_output = plan.d_output_final;
+        result.owns_output = plan.owns_output_final;
+        plan.d_output_final = nullptr;
+    } else {
+        result.d_output = plan.d_output;
+        result.owns_output = plan.owns_output;
+        plan.d_output = nullptr;
+    }
 
     if (plan.num_pairs == 0) {
         result.total_output_elements = 0;
@@ -2310,19 +3135,21 @@ GeneralSparseResult<T> pipeline_extract_result(PipelinePlan<T>& plan) {
         return result;
     }
 
+    const int32_t rank = plan.accum_map.output_rank;
     result.total_output_elements = plan.accum_map.total_output_elements;
     result.num_output_blocks = plan.accum_map.num_output_blocks;
-    result.output_rank = plan.accum_map.output_rank;
+    result.output_rank = rank;
     result.output_offsets.resize(plan.accum_map.num_output_blocks);
     result.output_volumes.resize(plan.accum_map.num_output_blocks);
-    result.output_block_coords.resize(plan.accum_map.num_output_blocks * plan.accum_map.output_rank);
+    result.output_block_coords.resize(plan.accum_map.num_output_blocks * rank);
 
+    const int32_t* i2o = plan.config.internal_to_output;
     for (int64_t i = 0; i < plan.accum_map.num_output_blocks; ++i) {
         result.output_offsets[i] = plan.accum_map.h_output_block_offsets[i];
         result.output_volumes[i] = plan.accum_map.h_output_block_volumes[i];
-        for (int32_t d = 0; d < plan.accum_map.output_rank; ++d) {
-            result.output_block_coords[i * plan.accum_map.output_rank + d] =
-                plan.accum_map.h_output_block_coords[i * plan.accum_map.output_rank + d];
+        for (int32_t d = 0; d < rank; ++d) {
+            result.output_block_coords[i * rank + i2o[d]] =
+                plan.accum_map.h_output_block_coords[i * rank + d];
         }
     }
 

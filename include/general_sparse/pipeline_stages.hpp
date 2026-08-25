@@ -89,7 +89,7 @@ void stage_medium_gemm(PipelinePlan<T>& plan, cudaStream_t stream)
     }
 }
 
-// Stage 5: Launch small GEMM (warp kernel).
+// Stage 5: Launch small GEMM (warp kernel) + dot-reduce for scalar descs.
 template <typename T>
 void stage_small_gemm(PipelinePlan<T>& plan, cudaStream_t stream)
 {
@@ -97,6 +97,11 @@ void stage_small_gemm(PipelinePlan<T>& plan, cudaStream_t stream)
         launch_warp_gemm<T>(plan.d_small_shapes, plan.d_small_mems,
             plan.d_warp_prefix, plan.small_num_descs,
             plan.total_warps, plan.warp_variant, stream);
+    }
+    if (plan.small_num_dots > 0) {
+        launch_dot_reduce<T>(plan.d_small_shapes, plan.d_small_mems,
+            plan.d_dot_indices, plan.small_num_dots,
+            plan.warp_variant, stream);
     }
 }
 
@@ -162,7 +167,7 @@ void stage_large_gemm_streamed_perqueue(PipelinePlan<T>& plan,
     for (int qi = 0; qi < NUM_SHAPE_QUEUES; ++qi) {
         const auto& partition = st.queue_partitions[qi];
         const auto& queue_large = st.queue_work[qi];
-        TileShape tile = st.queue_tiles[qi];
+        KernelChoice kernel = st.queue_kernels[qi];
 
         if (partition.batches.empty() || queue_large.empty()) continue;
 
@@ -193,14 +198,18 @@ void stage_large_gemm_streamed_perqueue(PipelinePlan<T>& plan,
             // 1. Build per-batch transpose precomp (using pre-allocated buffers)
             TransposeFlatMeta precomp_A, precomp_B;
             if (plan.layout_plan.plan_A.transpose) {
-                precomp_A = assemble_hypertile_batch<T>(
-                    batch.unique_blocks_A, A_gpu, plan.shape_map_A,
+                precomp_A = assemble_hypertile_batch(
+                    batch.unique_blocks_A,
+                    A_gpu.block_offsets.data(), A_gpu.block_volumes.data(),
+                    plan.shape_map_A,
                     plan.hypertile_index_A, plan.trivial_shapes_A,
                     batch.pack_offset_A, &st.precomp_bufs[slot][0], s);
             }
             if (plan.layout_plan.plan_B.transpose) {
-                precomp_B = assemble_hypertile_batch<T>(
-                    batch.unique_blocks_B, B_gpu, plan.shape_map_B,
+                precomp_B = assemble_hypertile_batch(
+                    batch.unique_blocks_B,
+                    B_gpu.block_offsets.data(), B_gpu.block_volumes.data(),
+                    plan.shape_map_B,
                     plan.hypertile_index_B, plan.trivial_shapes_B,
                     batch.pack_offset_B, &st.precomp_bufs[slot][1], s);
             }
@@ -223,7 +232,7 @@ void stage_large_gemm_streamed_perqueue(PipelinePlan<T>& plan,
             if (slot_active[other]) {
                 cudaStreamWaitEvent(s, st.gemm_done[other]);
             }
-            fill_cutlass_args_dispatch(st.args[slot], batch_work, T(1), T(1), tile, s);
+            fill_large_args_dispatch(st.args[slot], batch_work, T(1), T(1), kernel, s);
             cudaEventRecord(st.copy_done[slot], s);  // fires after H2D, before GEMM
             if (st.args[slot]) {
                 st.args[slot].run(s);

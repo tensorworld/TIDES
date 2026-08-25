@@ -12,25 +12,19 @@
 
 namespace bsptc {
 
-// Build hypertile index from shape_map templates. One index per operand,
-// built once during pipeline_allocate.
-template <typename T>
-HypertileIndex build_hypertile_index(
-    const GPUSparseInput<T>& gpu,
-    const typename GemmLayoutPlan::OperandPlan& op_plan,
+// Build hypertile index from an explicit permutation over unique shapes.
+// full_perm[src_dim] = destination position of src_dim (row-major both sides).
+// Shared core for the operand pre-GEMM transposes and the post-contraction
+// output permute.
+inline HypertileIndex build_hypertile_index_perm(
     const BlockShapeMap& shape_map,
+    dim_t rank,
+    const int32_t* full_perm,
     int tile_vol_limit = 1024)
 {
     HypertileIndex index;
-    if (gpu.num_blocks == 0) return index;
+    if (shape_map.num_unique == 0) return index;
 
-    const dim_t rank = gpu.rank;
-    const dim_t head_rank = rank - op_plan.unmoved_tail_dims;
-
-    // Build full-rank perm
-    std::vector<int32_t> full_perm(rank);
-    for (int32_t d = 0; d < head_rank; ++d) full_perm[d] = op_plan.perm[d];
-    for (int32_t d = head_rank; d < rank; ++d) full_perm[d] = d;
     std::vector<int32_t> inv_perm(rank);
     for (int32_t sd = 0; sd < rank; ++sd)
         inv_perm[full_perm[sd]] = sd;
@@ -45,9 +39,14 @@ HypertileIndex build_hypertile_index(
     // Single pass: build shape → determine WR → pack into correct slice
     for (int s = 0; s < num_shapes; ++s) {
         const dim_t* dims = shape_map.shape_dims(static_cast<uint32_t>(s));
-        auto r = build_task_for_shape(dims, rank, head_rank,
-                                       full_perm.data(), inv_perm.data(),
+        auto r = build_task_for_shape(dims, rank, rank,
+                                       full_perm, inv_perm.data(),
                                        tile_vol_limit);
+        if (r.rank_overflow) {
+            index.rank_overflow = true;
+            index.valid = false;
+            return index;  // caller must fail; skipping would drop the transpose
+        }
         if (r.skip) {
             index.per_shape[s] = {0, 0, 0, 0, true};
             continue;
@@ -108,6 +107,29 @@ HypertileIndex build_hypertile_index(
 
     index.valid = true;
     return index;
+}
+
+// Build hypertile index for an operand's pre-GEMM transpose. One index per
+// operand, built once during pipeline_prepare.
+template <typename T>
+HypertileIndex build_hypertile_index(
+    const GPUSparseInput<T>& gpu,
+    const typename GemmLayoutPlan::OperandPlan& op_plan,
+    const BlockShapeMap& shape_map,
+    int tile_vol_limit = 1024)
+{
+    if (gpu.num_blocks == 0) return HypertileIndex{};
+
+    const dim_t rank = gpu.rank;
+    const dim_t head_rank = rank - op_plan.unmoved_tail_dims;
+
+    // Build full-rank perm
+    std::vector<int32_t> full_perm(rank);
+    for (int32_t d = 0; d < head_rank; ++d) full_perm[d] = op_plan.perm[d];
+    for (int32_t d = head_rank; d < rank; ++d) full_perm[d] = d;
+
+    return build_hypertile_index_perm(shape_map, rank, full_perm.data(),
+                                      tile_vol_limit);
 }
 
 } // namespace bsptc

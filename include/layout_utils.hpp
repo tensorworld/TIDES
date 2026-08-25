@@ -129,11 +129,15 @@ inline const char* layout_name(LayoutType layout) {
 //             squash_dimensions_dual<MaxRank>()  — 2 stride sets
 
 // Stack-allocated squash result for 1 stride set.
+// rank is the TRUE squashed rank and may exceed MaxRank; only the outermost
+// min(rank, MaxRank) groups are written. Callers must reject results where
+// !fits() — the arrays never hold more than MaxRank valid groups.
 template <int MaxRank>
 struct SquashedDims {
     int rank = 0;
     int64_t shapes[MaxRank];
     int64_t strides[MaxRank];
+    bool fits() const { return rank <= MaxRank; }
 };
 
 // Stack-allocated squash result for 2 stride sets.
@@ -143,6 +147,7 @@ struct SquashedDimsDual {
     int64_t shapes[MaxRank];
     int64_t strides_a[MaxRank];
     int64_t strides_b[MaxRank];
+    bool fits() const { return rank <= MaxRank; }
 };
 
 namespace detail {
@@ -152,8 +157,10 @@ static constexpr int SQUASH_MAX_INPUT_RANK = 16;
 
 // Core squash implementation for NStrides stride sets.
 // Iterates inner-to-outer, skips size-1, merges contiguous groups.
-// Writes results into out_shapes/out_strides in outer-to-inner order.
-// Returns the squashed rank.
+// Writes at most max_out groups into out_shapes/out_strides in outer-to-inner
+// order. Returns the TRUE squashed rank, which may exceed max_out — the
+// writes are clamped so overflow can never corrupt the output arrays, even
+// in NDEBUG builds. Callers detect overflow via rank > max_out (fits()).
 template <int NStrides>
 inline int squash_impl(
     const int64_t* shapes, const int64_t* const (&strides)[NStrides],
@@ -215,11 +222,10 @@ inline int squash_impl(
         return 1;
     }
 
-    assert(n <= max_out && "squashed rank exceeds output capacity");
-    (void)max_out;
-
-    // Reverse to restore outer-to-inner order
-    for (int i = 0; i < n; ++i) {
+    // Reverse to restore outer-to-inner order; clamp writes to capacity
+    // (keeps the outermost groups — callers reject clamped results anyway).
+    const int out_n = n < max_out ? n : max_out;
+    for (int i = 0; i < out_n; ++i) {
         int ri = n - 1 - i;
         out_shapes[i] = tmp_shapes[ri];
         for (int s = 0; s < NStrides; ++s)
@@ -237,10 +243,16 @@ template <int MaxRank, typename TShape, typename TStride>
 inline SquashedDims<MaxRank> squash_dimensions(
     const TShape* shapes, const TStride* strides, int rank)
 {
+    SquashedDims<MaxRank> overflow_guard{};
+    if (rank > detail::SQUASH_MAX_INPUT_RANK) {
+        // Unprocessable input rank: report a rank that never fits so the
+        // caller rejects; arrays stay unwritten.
+        overflow_guard.rank = rank;
+        return overflow_guard;
+    }
     // Promote inputs to int64_t
     int64_t s64[detail::SQUASH_MAX_INPUT_RANK];
     int64_t st64[detail::SQUASH_MAX_INPUT_RANK];
-    assert(rank <= detail::SQUASH_MAX_INPUT_RANK);
     for (int i = 0; i < rank; ++i) {
         s64[i] = static_cast<int64_t>(shapes[i]);
         st64[i] = static_cast<int64_t>(strides[i]);
@@ -261,10 +273,14 @@ inline SquashedDimsDual<MaxRank> squash_dimensions_dual(
     const TStride* strides_a, const TStride* strides_b,
     int rank)
 {
+    SquashedDimsDual<MaxRank> overflow_guard{};
+    if (rank > detail::SQUASH_MAX_INPUT_RANK) {
+        overflow_guard.rank = rank;
+        return overflow_guard;
+    }
     int64_t s64[detail::SQUASH_MAX_INPUT_RANK];
     int64_t sta64[detail::SQUASH_MAX_INPUT_RANK];
     int64_t stb64[detail::SQUASH_MAX_INPUT_RANK];
-    assert(rank <= detail::SQUASH_MAX_INPUT_RANK);
     for (int i = 0; i < rank; ++i) {
         s64[i] = static_cast<int64_t>(shapes[i]);
         sta64[i] = static_cast<int64_t>(strides_a[i]);
