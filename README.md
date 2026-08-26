@@ -66,7 +66,10 @@ cmake -S . -B build \
 cmake --build build -j
 ```
 
-For Ampere use `-DBSPTC_ARCH=sm80 -DCMAKE_CUDA_ARCHITECTURES=80`. Drop
+For Ampere use `-DBSPTC_ARCH=sm80 -DCMAKE_CUDA_ARCHITECTURES=80`.
+`BSPTC_ARCH` accepts any `smXX` nvcc does, so a minor version such as
+`-DBSPTC_ARCH=sm86` (RTX A4500) or an architecture-specific `-DBSPTC_ARCH=sm90a`
+works too, and sets `CMAKE_CUDA_ARCHITECTURES` to match. Drop
 `-DCUTLASS_ROOT` / `-DCUTENSOR_ROOT` if the dependencies are already at the
 default locations from steps 1 and 2. The build produces the benchmark and
 test binaries under `build/`.

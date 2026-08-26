@@ -10,18 +10,18 @@ endif()
 # CMAKE_CUDA_ARCHITECTURES from the nvcc default (52 on CUDA 12.x, 75 on
 # CUDA 13), which would silently override the BSPTC_ARCH mapping below.
 set(_bsptc_arch_default "sm80")
-set(BSPTC_ARCH "${_bsptc_arch_default}" CACHE STRING "Target GPU architecture (sm80, sm90, or sm120).")
-set_property(CACHE BSPTC_ARCH PROPERTY STRINGS "sm80" "sm90" "sm120")
+set(BSPTC_ARCH "${_bsptc_arch_default}" CACHE STRING
+    "Target GPU architecture as smXX, e.g. sm80, sm86, sm90, sm90a, sm120.")
+set_property(CACHE BSPTC_ARCH PROPERTY STRINGS "sm80" "sm86" "sm90" "sm90a" "sm120")
 
-if(BSPTC_ARCH STREQUAL "sm120")
-  set(_bsptc_arch_num 120)
-elseif(BSPTC_ARCH STREQUAL "sm90")
-  set(_bsptc_arch_num 90)
-elseif(BSPTC_ARCH STREQUAL "sm80")
-  set(_bsptc_arch_num 80)
+# smXX -> XX, for any XX nvcc accepts (including the architecture-specific
+# 'a'/'f' suffixes, and minor versions such as 86 that the common values omit).
+if(BSPTC_ARCH MATCHES "^sm([0-9]+[af]?)$")
+  set(_bsptc_arch_num "${CMAKE_MATCH_1}")
 else()
   message(FATAL_ERROR
-    "BSPTC_ARCH must be one of sm80, sm90, sm120 (got '${BSPTC_ARCH}').")
+    "BSPTC_ARCH must look like smXX -- e.g. sm80, sm86, sm90, sm90a, sm120 "
+    "(got '${BSPTC_ARCH}').")
 endif()
 
 # The mapping is written to the CACHE so it survives re-configuration and is
