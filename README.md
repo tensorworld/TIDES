@@ -60,26 +60,24 @@ top of this repository, on a **fresh** `build/` directory:
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DBSPTC_ARCH=sm90 \
-  -DCMAKE_CUDA_ARCHITECTURES=90 \
   -DCUTLASS_ROOT=$(pwd)/../cutlass \
   -DCUTENSOR_ROOT=$(pwd)/libcutensor
 cmake --build build -j
 ```
 
-For Ampere use `-DBSPTC_ARCH=sm80 -DCMAKE_CUDA_ARCHITECTURES=80`.
-`BSPTC_ARCH` accepts any `smXX` nvcc does, so a minor version such as
-`-DBSPTC_ARCH=sm86` (RTX A4500) or an architecture-specific `-DBSPTC_ARCH=sm90a`
-works too, and sets `CMAKE_CUDA_ARCHITECTURES` to match. Drop
-`-DCUTLASS_ROOT` / `-DCUTENSOR_ROOT` if the dependencies are already at the
-default locations from steps 1 and 2. The build produces the benchmark and
-test binaries under `build/`.
+`BSPTC_ARCH` accepts any `smXX` that nvcc does and sets
+`CMAKE_CUDA_ARCHITECTURES` to match, so use `-DBSPTC_ARCH=sm80` for Ampere,
+`-DBSPTC_ARCH=sm86` for an RTX A4500, or `-DBSPTC_ARCH=sm90a` if you want the
+architecture-specific target. Drop `-DCUTLASS_ROOT` / `-DCUTENSOR_ROOT` if the
+dependencies are already at the default locations from steps 1 and 2. The build
+produces the benchmark and test binaries under `build/`.
 
-`-DCMAKE_CUDA_ARCHITECTURES` is redundant with `-DBSPTC_ARCH` on a fresh build
-directory, and is included above because it is the one setting that is
-authoritative in every situation. `BSPTC_ARCH` is a convenience that maps to
-it, and CMake ignores that mapping if `CMAKE_CUDA_ARCHITECTURES` is already
-cached from an earlier configure, or if `CUDAARCHS` is set in the environment
-(some HPC module files set it). Both cases are now reported at configure time.
+`BSPTC_ARCH` is sufficient on its own, with two exceptions that CMake now
+reports at configure time: it is ignored if `CMAKE_CUDA_ARCHITECTURES` is
+already cached from an earlier configure of the same directory, or if
+`CUDAARCHS` is set in the environment (some HPC module files set it). In either
+case, use a fresh build directory or pass `-DCMAKE_CUDA_ARCHITECTURES=90`
+explicitly.
 
 **Verify before building**: the configure output must contain
 
