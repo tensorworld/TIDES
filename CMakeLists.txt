@@ -40,7 +40,7 @@ if(DEFINED ENV{CUDAARCHS} AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES ${_bsptc_arch_num}
       CACHE STRING "CUDA architectures (derived from BSPTC_ARCH)" FORCE)
-elseif(NOT "${CMAKE_CUDA_ARCHITECTURES}" MATCHES "(^|;)${_bsptc_arch_num}(-real|-virtual)?(;|$)"
+elseif(NOT "${CMAKE_CUDA_ARCHITECTURES}" MATCHES "(^|;)${_bsptc_arch_num}[af]?(-real|-virtual)?(;|$)"
        AND NOT BSPTC_ARCH STREQUAL "${_bsptc_arch_default}")
   # (2) A build directory configured earlier already has the value cached, so
   #     changing BSPTC_ARCH now has no effect.  Passing CMAKE_CUDA_ARCHITECTURES
