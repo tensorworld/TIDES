@@ -53,18 +53,47 @@ repo as `libcutensor/`, or pass `-DCUTENSOR_ROOT=/path/to/cutensor` to CMake.
 
 ### 3. Build
 
+The full configure command, with every path given explicitly. Run it from the
+top of this repository, on a **fresh** `build/` directory:
+
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBSPTC_ARCH=sm90
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBSPTC_ARCH=sm90 \
+  -DCMAKE_CUDA_ARCHITECTURES=90 \
+  -DCUTLASS_ROOT=$(pwd)/../cutlass \
+  -DCUTENSOR_ROOT=$(pwd)/libcutensor
 cmake --build build -j
 ```
 
-Use `-DBSPTC_ARCH=sm80` for Ampere. The build produces the benchmark and
+For Ampere use `-DBSPTC_ARCH=sm80 -DCMAKE_CUDA_ARCHITECTURES=80`. Drop
+`-DCUTLASS_ROOT` / `-DCUTENSOR_ROOT` if the dependencies are already at the
+default locations from steps 1 and 2. The build produces the benchmark and
 test binaries under `build/`.
 
-`BSPTC_ARCH` must be set at configure time on a **fresh** build directory:
-enabling the CUDA language caches `CMAKE_CUDA_ARCHITECTURES`, so reusing a
-directory configured for another architecture silently keeps the old value.
-Confirm with the `CUDA architectures: 90` line in the configure output.
+`-DCMAKE_CUDA_ARCHITECTURES` is redundant with `-DBSPTC_ARCH` on a fresh build
+directory, and is included above because it is the one setting that is
+authoritative in every situation. `BSPTC_ARCH` is a convenience that maps to
+it, and CMake ignores that mapping if `CMAKE_CUDA_ARCHITECTURES` is already
+cached from an earlier configure, or if `CUDAARCHS` is set in the environment
+(some HPC module files set it). Both cases are now reported at configure time.
+
+**Verify before building**: the configure output must contain
+
+```
+-- CUDA architectures: 90 (BSPTC_ARCH=sm90)
+```
+
+If it names a different architecture, stop and fix it — the build either fails
+with `no instance of overloaded function "atomicAdd" matches the argument
+list` (architectures below SM 6.0 have no `atomicAdd` for `double`), or, worse,
+succeeds for the wrong target and silently PTX-JITs at run time, which
+invalidates every timing number it produces. After building, confirm the real
+thing:
+
+```bash
+cuobjdump --list-elf build/bench_pipeline_implementations | grep -o 'sm_[0-9]*' | sort -u
+```
 
 ### 4. Large-tier backend selection
 

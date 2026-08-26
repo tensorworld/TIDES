@@ -7,22 +7,70 @@ endif()
 
 # Target architecture selection.
 # Must be resolved BEFORE project(): enabling the CUDA language caches
-# CMAKE_CUDA_ARCHITECTURES from the nvcc default (e.g. 75 on CUDA 13),
-# which would silently override the BSPTC_ARCH mapping below.
-set(BSPTC_ARCH "sm80" CACHE STRING "Target GPU architecture (sm80, sm90, or sm120).")
+# CMAKE_CUDA_ARCHITECTURES from the nvcc default (52 on CUDA 12.x, 75 on
+# CUDA 13), which would silently override the BSPTC_ARCH mapping below.
+set(_bsptc_arch_default "sm80")
+set(BSPTC_ARCH "${_bsptc_arch_default}" CACHE STRING "Target GPU architecture (sm80, sm90, or sm120).")
 set_property(CACHE BSPTC_ARCH PROPERTY STRINGS "sm80" "sm90" "sm120")
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
-  if(BSPTC_ARCH STREQUAL "sm120")
-    set(CMAKE_CUDA_ARCHITECTURES 120)
-  elseif(BSPTC_ARCH STREQUAL "sm90")
-    set(CMAKE_CUDA_ARCHITECTURES 90)
-  else()
-    set(CMAKE_CUDA_ARCHITECTURES 80)
-  endif()
+
+if(BSPTC_ARCH STREQUAL "sm120")
+  set(_bsptc_arch_num 120)
+elseif(BSPTC_ARCH STREQUAL "sm90")
+  set(_bsptc_arch_num 90)
+elseif(BSPTC_ARCH STREQUAL "sm80")
+  set(_bsptc_arch_num 80)
+else()
+  message(FATAL_ERROR
+    "BSPTC_ARCH must be one of sm80, sm90, sm120 (got '${BSPTC_ARCH}').")
+endif()
+
+# The mapping is written to the CACHE so it survives re-configuration and is
+# visible in CMakeCache.txt.  Two situations make BSPTC_ARCH alone insufficient,
+# and both used to fail silently -- the build died much later with
+# "no instance of overloaded function atomicAdd matches the argument list",
+# because atomicAdd(double*, double) requires SM 6.0 and the effective
+# architecture had fallen back to the nvcc default.
+if(DEFINED ENV{CUDAARCHS} AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  # (1) CUDAARCHS in the environment (some HPC module files set it) is
+  #     consumed by CMake before we get a say.
+  message(WARNING
+    "CUDAARCHS=$ENV{CUDAARCHS} is set in the environment and takes precedence "
+    "over BSPTC_ARCH=${BSPTC_ARCH}.  Unset CUDAARCHS, or pass "
+    "-DCMAKE_CUDA_ARCHITECTURES=${_bsptc_arch_num} explicitly.")
+elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES ${_bsptc_arch_num}
+      CACHE STRING "CUDA architectures (derived from BSPTC_ARCH)" FORCE)
+elseif(NOT "${CMAKE_CUDA_ARCHITECTURES}" MATCHES "(^|;)${_bsptc_arch_num}(-real|-virtual)?(;|$)"
+       AND NOT BSPTC_ARCH STREQUAL "${_bsptc_arch_default}")
+  # (2) A build directory configured earlier already has the value cached, so
+  #     changing BSPTC_ARCH now has no effect.  Passing CMAKE_CUDA_ARCHITECTURES
+  #     directly is also legitimate (it can express architectures BSPTC_ARCH
+  #     cannot, such as 86), so say what is in effect rather than assuming.
+  message(WARNING
+    "CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} is in effect, so "
+    "BSPTC_ARCH=${BSPTC_ARCH} (which maps to ${_bsptc_arch_num}) is ignored.  "
+    "That is expected if you passed -DCMAKE_CUDA_ARCHITECTURES deliberately.  "
+    "Otherwise this is a build directory configured earlier for another "
+    "architecture -- BSPTC_ARCH is only honoured on a fresh one.  Delete the "
+    "build directory, or pass -DCMAKE_CUDA_ARCHITECTURES=${_bsptc_arch_num}.")
 endif()
 
 project(bsptc LANGUAGES C CXX CUDA)
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES} (BSPTC_ARCH=${BSPTC_ARCH})")
+
+# Fail now, with a remedy, rather than deep in a translation unit.  The kernels
+# accumulate in double precision with atomicAdd, which needs SM 6.0 or newer.
+foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX MATCH "^[0-9]+" _arch_num "${_arch}")
+  if(_arch_num AND _arch_num LESS 60)
+    message(FATAL_ERROR
+      "CUDA architecture ${_arch} is too old: TIDES needs SM 6.0 or newer for "
+      "atomicAdd on double.  The effective CMAKE_CUDA_ARCHITECTURES is "
+      "'${CMAKE_CUDA_ARCHITECTURES}', which is nvcc's default rather than the "
+      "value BSPTC_ARCH=${BSPTC_ARCH} asks for.  Configure a fresh build "
+      "directory, or pass -DCMAKE_CUDA_ARCHITECTURES=${_bsptc_arch_num}.")
+  endif()
+endforeach()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
