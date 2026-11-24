@@ -3,8 +3,10 @@
 #include "block_sparse_tensor.hpp"
 #include "block_utils.hpp"
 #include "data_init_utils.hpp"
+#include "tensorsuite_parser.hpp"
 #include "types.hpp"
 
+#include <filesystem>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -219,11 +221,66 @@ inline BlockSparseTensor parse_bs_tensor_file(const std::string& filename, DataT
     return tensor;
 }
 
-inline std::vector<BlockSparseTensor> parse_tensor_files(const std::vector<std::string>& files, DataType dtype_, bool skip_values = false) {
+inline bool is_tensorsuite_path(const std::string& path_str) {
+    namespace fs = std::filesystem;
+    const fs::path p(path_str);
+    if (fs::is_directory(p)) return true;
+    const std::string ext = p.extension().string();
+    if (ext == ".tns" || ext == ".tnsb" || ext == ".json") return true;
+    std::ifstream probe(path_str, std::ios::binary);
+    if (probe.is_open()) {
+        std::string first_line;
+        if (std::getline(probe, first_line)) {
+            if (first_line.rfind("%%TensorSuite-", 0) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Unified loader supporting both TIDES .bs files and TensorSuite block-sparse
+// bundles (bundle directory, *_metadata.json, .tns, or .tnsb).
+// Note: .bs files embed authoritative mode labels in their header and are never
+// relabeled; `labels` is only used for formats (like TensorSuite) that omit labels.
+inline BlockSparseTensor parse_tensor_file(
+    const std::string& filename,
+    DataType dtype,
+    const std::vector<char>& labels = {},
+    bool skip_values = false)
+{
+    if (is_tensorsuite_path(filename)) {
+        return parse_tensorsuite_tensor(filename, dtype, labels, skip_values);
+    }
+    return parse_bs_tensor_file(filename, dtype, skip_values);
+}
+
+inline std::vector<BlockSparseTensor> parse_tensor_files(
+    const std::vector<std::string>& files,
+    DataType dtype_,
+    bool skip_values = false)
+{
     std::vector<BlockSparseTensor> tensors;
     tensors.reserve(files.size());
-    for (const auto &filename : files) {
-        tensors.push_back(parse_bs_tensor_file(filename, dtype_, skip_values));
+    for (const auto& filename : files) {
+        tensors.push_back(parse_tensor_file(filename, dtype_, {}, skip_values));
+    }
+    return tensors;
+}
+
+inline std::vector<BlockSparseTensor> parse_tensor_files(
+    const std::vector<std::string>& files,
+    DataType dtype_,
+    const std::vector<std::vector<char>>& labels_per_tensor,
+    bool skip_values = false)
+{
+    if (labels_per_tensor.size() != files.size()) {
+        throw std::runtime_error("parse_tensor_files: labels count != files count");
+    }
+    std::vector<BlockSparseTensor> tensors;
+    tensors.reserve(files.size());
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        tensors.push_back(parse_tensor_file(files[i], dtype_, labels_per_tensor[i], skip_values));
     }
     return tensors;
 }

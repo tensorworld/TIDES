@@ -30,6 +30,10 @@ using namespace bsptc;
 namespace fs = std::filesystem;
 
 static std::string g_filter;
+static std::string g_data_root;
+static std::string g_tensorA;
+static std::string g_tensorB;
+static std::string g_einsum;
 static int g_warmup = 1;
 static int g_repeat = 3;
 static bool g_no_verify = false;
@@ -63,6 +67,41 @@ ContractionInfo parse_info_file(const std::string& path) {
     while (!info.einsum.empty() && info.einsum.front() == ' ')
         info.einsum.erase(info.einsum.begin());
     return info;
+}
+
+// Resolve an operand path inside dir_path, supporting both .bs files and
+// TensorSuite bundles (bundle directory, .tnsb, or .tns).
+std::string resolve_operand_path(const std::string& dir_path, const std::string& stem) {
+    const fs::path base(dir_path);
+    const std::vector<fs::path> candidates = {
+        base / (stem + ".bs"),
+        base / stem,
+        base / (stem + ".tnsb"),
+        base / (stem + ".tns"),
+    };
+    for (const auto& c : candidates) {
+        if (fs::exists(c)) return c.string();
+    }
+    return (base / (stem + ".bs")).string();
+}
+
+// Extract einsum from a TensorSuite bundle README.md if present:
+//   - Einsum (this contraction): `dea,fag->defg`
+//   - Einsum: `ij,jk->ik`
+std::string parse_einsum_from_readme(const fs::path& readme_path) {
+    std::ifstream f(readme_path);
+    if (!f.is_open()) return "";
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.find("Einsum") == std::string::npos) continue;
+        const auto tick1 = line.find('`');
+        if (tick1 == std::string::npos) continue;
+        const auto tick2 = line.find('`', tick1 + 1);
+        if (tick2 != std::string::npos && tick2 > tick1 + 1) {
+            return line.substr(tick1 + 1, tick2 - tick1 - 1);
+        }
+    }
+    return "";
 }
 
 // Run a single implementation and return median time in ms.
@@ -425,9 +464,15 @@ void print_breakdown(const char* label, const PipelineTimingBreakdown& tb) {
 }
 
 template <typename T>
-void run_bench(const std::string& name, const std::string& dir_path, const ContractionInfo& info) {
-    std::cout << name << "  einsum=" << info.einsum
-              << "  A_blk=" << info.A_blocks << "  B_blk=" << info.B_blocks << "\n";
+void run_bench(const std::string& name,
+               const std::string& fileA,
+               const std::string& fileB,
+               const ContractionInfo& info) {
+    std::cout << name << "  einsum=" << info.einsum;
+    if (info.A_blocks > 0 || info.B_blocks > 0) {
+        std::cout << "  A_blk=" << info.A_blocks << "  B_blk=" << info.B_blocks;
+    }
+    std::cout << "\n";
 
     // cuTENSOR errors can permanently corrupt the CUDA context
     if (g_cuda_context_dirty) {
@@ -437,17 +482,20 @@ void run_bench(const std::string& name, const std::string& dir_path, const Contr
     }
 
     try {
-        std::string fileA = dir_path + "/" + name + "_A.bs";
-        std::string fileB = dir_path + "/" + name + "_B.bs";
-
         auto t_init = std::chrono::high_resolution_clock::now();
 
+        auto expr = parse_einsum(info.einsum);
+        if (expr.inputs.size() != 2) {
+            throw std::runtime_error("Expected binary einsum with 2 inputs");
+        }
+        std::vector<char> labelsA(expr.inputs[0].labels.begin(), expr.inputs[0].labels.end());
+        std::vector<char> labelsB(expr.inputs[1].labels.begin(), expr.inputs[1].labels.end());
+
         DataType dtype = std::is_same<T, double>::value ? DataType::FLOAT64 : DataType::FLOAT32;
-        auto tensors = parse_tensor_files({fileA, fileB}, dtype);
+        auto tensors = parse_tensor_files({fileA, fileB}, dtype, {labelsA, labelsB});
         BlockSparseTensor& A = tensors[0];
         BlockSparseTensor& B = tensors[1];
 
-        auto expr = parse_einsum(info.einsum);
         std::vector<std::vector<int64_t>> shapes = {
             block_utils::compute_full_shape(A), block_utils::compute_full_shape(B)
         };
@@ -844,6 +892,10 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if ((arg == "--filter" || arg == "-f") && i + 1 < argc) g_filter = argv[++i];
+        else if (arg == "--data-root" && i + 1 < argc) g_data_root = argv[++i];
+        else if ((arg == "--tensorA" || arg == "-A") && i + 1 < argc) g_tensorA = argv[++i];
+        else if ((arg == "--tensorB" || arg == "-B") && i + 1 < argc) g_tensorB = argv[++i];
+        else if (arg == "--einsum" && i + 1 < argc) g_einsum = argv[++i];
         else if (arg == "--warmup" && i + 1 < argc) g_warmup = std::stoi(argv[++i]);
         else if (arg == "--repeat" && i + 1 < argc) g_repeat = std::stoi(argv[++i]);
         else if (arg == "--no-verify") g_no_verify = true;
@@ -877,23 +929,84 @@ int main(int argc, char** argv) {
     std::cout << "\n";
     std::cout << std::flush;
 
-    std::string data_root = "../generated_tensors/cutensor_converted";
+    // Single-pair mode: --tensorA <path> --tensorB <path> [--einsum <expr>]
+    if (!g_tensorA.empty() || !g_tensorB.empty()) {
+        if (g_tensorA.empty() || g_tensorB.empty()) {
+            std::cerr << "Error: --tensorA and --tensorB must both be specified\n";
+            return 1;
+        }
+        ContractionInfo info{};
+        info.einsum = g_einsum;
+        if (info.einsum.empty()) {
+            const fs::path pA(g_tensorA);
+            const fs::path readme = fs::is_directory(pA) ? (pA / "README.md") : (pA.parent_path() / "README.md");
+            info.einsum = parse_einsum_from_readme(readme);
+        }
+        if (info.einsum.empty()) {
+            std::cerr << "Error: --einsum is required (not found in README.md)\n";
+            return 1;
+        }
+        std::string case_name = fs::path(g_tensorA).stem().string();
+        if (case_name.size() > 2 && case_name.compare(case_name.size() - 2, 2, "_A") == 0) {
+            case_name.resize(case_name.size() - 2);
+        }
+        if (g_f64)
+            run_bench<double>(case_name, g_tensorA, g_tensorB, info);
+        else
+            run_bench<float>(case_name, g_tensorA, g_tensorB, info);
+        std::cout << "========================================\n";
+        std::cout << "Done.\n";
+        return 0;
+    }
 
-    std::vector<std::string> test_dirs;
+    std::string data_root = g_data_root.empty() ? "../generated_tensors/cutensor_converted" : g_data_root;
+
+    struct BenchCase {
+        std::string name;
+        std::string fileA;
+        std::string fileB;
+        ContractionInfo info;
+    };
+    std::vector<BenchCase> cases;
+
+    // 1. Standard layout: <data_root>/<case>/<case>_{A,B}.{bs,tns,tnsb} or <case>_{A,B}/ + <case>_info.txt
+    // 2. Flat TensorSuite bundle layout: <data_root>/<case>_A/ and <data_root>/<case>_B/
+    std::vector<std::string> subdirs;
     for (const auto& entry : fs::directory_iterator(data_root)) {
         if (!entry.is_directory()) continue;
-        std::string dirname = entry.path().filename().string();
-        if (dirname.find("_E") == std::string::npos && dirname.find("_S") == std::string::npos) continue;
-        if (!g_filter.empty() && dirname.find(g_filter) == std::string::npos) continue;
-        test_dirs.push_back(dirname);
+        subdirs.push_back(entry.path().filename().string());
     }
-    std::sort(test_dirs.begin(), test_dirs.end());
+    std::sort(subdirs.begin(), subdirs.end());
 
-    std::cout << "Test cases: " << test_dirs.size();
-    if (!g_filter.empty()) std::cout << " (filter: " << g_filter << ")";
-    std::cout << "\n\n" << std::flush;
+    for (const auto& dirname : subdirs) {
+        if (dirname.size() > 2 && dirname.compare(dirname.size() - 2, 2, "_A") == 0) {
+            const std::string base_name = dirname.substr(0, dirname.size() - 2);
+            if (!g_filter.empty() && base_name.find(g_filter) == std::string::npos) continue;
+            const fs::path dirA = fs::path(data_root) / dirname;
+            const fs::path dirB = fs::path(data_root) / (base_name + "_B");
+            if (!fs::is_directory(dirB)) continue;
+            if (find_tensorsuite_metadata_path(dirA.string()).empty()) continue;
 
-    for (const auto& dirname : test_dirs) {
+            ContractionInfo info{};
+            const fs::path info_path = fs::path(data_root) / (base_name + "_info.txt");
+            if (fs::is_regular_file(info_path)) {
+                try { info = parse_info_file(info_path.string()); } catch (...) {}
+            }
+            if (info.einsum.empty()) {
+                info.einsum = parse_einsum_from_readme(dirA / "README.md");
+            }
+            if (info.einsum.empty()) {
+                std::cout << base_name << "  SKIPPED (no einsum in info.txt or README.md)\n\n" << std::flush;
+                continue;
+            }
+            cases.push_back({base_name, dirA.string(), dirB.string(), info});
+            continue;
+        }
+
+        if (dirname.find("_E") == std::string::npos && dirname.find("_S") == std::string::npos) continue;
+        if (dirname.size() > 2 && dirname.compare(dirname.size() - 2, 2, "_B") == 0) continue;
+        if (!g_filter.empty() && dirname.find(g_filter) == std::string::npos) continue;
+
         std::string dir_path = data_root + "/" + dirname;
         std::string info_path = dir_path + "/" + dirname + "_info.txt";
 
@@ -901,10 +1014,23 @@ int main(int argc, char** argv) {
         try { info = parse_info_file(info_path); }
         catch (...) { std::cout << dirname << "  SKIPPED (no info file)\n\n" << std::flush; continue; }
 
+        cases.push_back({
+            dirname,
+            resolve_operand_path(dir_path, dirname + "_A"),
+            resolve_operand_path(dir_path, dirname + "_B"),
+            info
+        });
+    }
+
+    std::cout << "Test cases: " << cases.size();
+    if (!g_filter.empty()) std::cout << " (filter: " << g_filter << ")";
+    std::cout << "\n\n" << std::flush;
+
+    for (const auto& c : cases) {
         if (g_f64)
-            run_bench<double>(dirname, dir_path, info);
+            run_bench<double>(c.name, c.fileA, c.fileB, c.info);
         else
-            run_bench<float>(dirname, dir_path, info);
+            run_bench<float>(c.name, c.fileA, c.fileB, c.info);
     }
 
     std::cout << "========================================\n";
