@@ -267,6 +267,12 @@ target_include_directories(test_pipeline_verification PRIVATE ${CMAKE_SOURCE_DIR
 target_link_libraries(test_pipeline_verification PRIVATE ${PIPELINE_LIBS})
 add_test(NAME test_pipeline_verification COMMAND test_pipeline_verification)
 
+# Pure C++ unit tests for mini_json and TensorSuite block-sparse format parser
+add_executable(test_tensorsuite_parser tests/test_tensorsuite_parser.cpp)
+target_include_directories(test_tensorsuite_parser PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_tensorsuite_parser PRIVATE ${BSPTC_CXX_WARNINGS})
+add_test(NAME test_tensorsuite_parser COMMAND test_tensorsuite_parser)
+
 # Pipeline implementation benchmark (CUTLASS vs cuTENSOR on real data)
 add_cuda_executable(bench_pipeline_implementations tests/bench_pipeline_implementations.cu)
 target_link_libraries(bench_pipeline_implementations PRIVATE ${PIPELINE_LIBS})

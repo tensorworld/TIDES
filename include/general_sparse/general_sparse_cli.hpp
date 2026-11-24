@@ -22,8 +22,8 @@ struct GeneralSparseOptions {
 inline void print_general_sparse_usage(const char* prog) {
     std::cerr << "Usage: " << prog << " [options] <einsum>\n"
               << "Options:\n"
-              << "  --tensorA <file>       Path to tensor A file (default: tensor_A.bs)\n"
-              << "  --tensorB <file>       Path to tensor B file (default: tensor_B.bs)\n"
+              << "  --tensorA <path>       Path to tensor A (.bs, .tns, .tnsb, or TensorSuite bundle dir)\n"
+              << "  --tensorB <path>       Path to tensor B (.bs, .tns, .tnsb, or TensorSuite bundle dir)\n"
               << "  --dtype <f16|f32|f64>  Element type (default: f32)\n"
               << "  --einsum <expr>        Einsum expression (positional also supported)\n"
               << "  --verbose              Print detailed output\n"

@@ -12,9 +12,21 @@ using namespace bsptc;
 
 template <typename T>
 int run_general_sparse_test(const GeneralSparseOptions& opts) {
-    // Parse input tensors
+    // Parse einsum expression first so mode labels can be supplied to formats
+    // (like TensorSuite) that do not store contraction labels in the file.
+    std::cout << "Parsing einsum: " << opts.einsum << "\n";
+    auto expr = parse_einsum(opts.einsum);
+    if (expr.inputs.size() != 2) {
+        throw std::runtime_error("Expected binary einsum with 2 inputs, got " +
+                                 std::to_string(expr.inputs.size()));
+    }
+
+    std::vector<char> labelsA(expr.inputs[0].labels.begin(), expr.inputs[0].labels.end());
+    std::vector<char> labelsB(expr.inputs[1].labels.begin(), expr.inputs[1].labels.end());
+
+    // Parse input tensors (.bs or TensorSuite block-sparse bundle/.tns/.tnsb)
     std::cout << "Loading tensors...\n";
-    auto tensors = parse_tensor_files({opts.tensorA, opts.tensorB}, opts.dtype);
+    auto tensors = parse_tensor_files({opts.tensorA, opts.tensorB}, opts.dtype, {labelsA, labelsB});
     BlockSparseTensor& A = tensors[0];
     BlockSparseTensor& B = tensors[1];
 
@@ -24,10 +36,6 @@ int run_general_sparse_test(const GeneralSparseOptions& opts) {
     std::cout << "  Tensor B: " << B.meta.name << " ("
               << std::string(B.meta.indices.begin(), B.meta.indices.end()) << ") "
               << B.block_coords.size() << " blocks\n";
-
-    // Parse einsum expression
-    std::cout << "Parsing einsum: " << opts.einsum << "\n";
-    auto expr = parse_einsum(opts.einsum);
 
     // Validate shapes
     std::vector<std::vector<int64_t>> shapes = {
