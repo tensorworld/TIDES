@@ -241,6 +241,8 @@ inline bool is_tensorsuite_path(const std::string& path_str) {
 
 // Unified loader supporting both TIDES .bs files and TensorSuite block-sparse
 // bundles (bundle directory, *_metadata.json, .tns, or .tnsb).
+// Note: .bs files embed authoritative mode labels in their header and are never
+// relabeled; `labels` is only used for formats (like TensorSuite) that omit labels.
 inline BlockSparseTensor parse_tensor_file(
     const std::string& filename,
     DataType dtype,
@@ -250,11 +252,7 @@ inline BlockSparseTensor parse_tensor_file(
     if (is_tensorsuite_path(filename)) {
         return parse_tensorsuite_tensor(filename, dtype, labels, skip_values);
     }
-    BlockSparseTensor tensor = parse_bs_tensor_file(filename, dtype, skip_values);
-    if (!labels.empty() && labels != tensor.meta.indices) {
-        relabel_block_sparse_tensor(tensor, labels);
-    }
-    return tensor;
+    return parse_bs_tensor_file(filename, dtype, skip_values);
 }
 
 inline std::vector<BlockSparseTensor> parse_tensor_files(

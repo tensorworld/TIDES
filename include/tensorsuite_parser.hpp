@@ -332,6 +332,10 @@ inline BlockSparseTensor ts_build_tensor(
     }
 
     if (!skip_values && total_block_elems > 0) {
+        if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT64) {
+            throw std::runtime_error(
+                "TensorSuite host value initialization only supports FLOAT32 and FLOAT64");
+        }
         tensor.host_data.allocate(total_block_elems);
         const std::string domain = meta ? meta->value_domain : "general";
         if (domain == "binary") {
@@ -391,11 +395,12 @@ inline TensorSuiteMetadata parse_tensorsuite_metadata(const std::string& json_pa
         meta.values_provided = root.at("values_provided").as_bool();
     }
 
-    meta.index_type = detail::ts_opt_string(root, "index_type", "uint64");
-    meta.endianness = detail::ts_opt_string(root, "endianness", "little");
-    if (root.contains("index_base") && !root.at("index_base").is_null()) {
-        meta.index_base = static_cast<int>(root.at("index_base").as_int());
+    meta.index_type = detail::ts_opt_string(root, "index_type");
+    meta.endianness = detail::ts_opt_string(root, "endianness");
+    if (!root.contains("index_base") || root.at("index_base").is_null()) {
+        throw std::runtime_error("TensorSuite metadata JSON missing required 'index_base': " + json_path);
     }
+    meta.index_base = static_cast<int>(root.at("index_base").as_int());
     if (meta.index_base != 0 && meta.index_base != 1) {
         throw std::runtime_error("TensorSuite metadata index_base must be 0 or 1");
     }
@@ -485,25 +490,30 @@ inline std::string find_tensorsuite_metadata_path(const std::string& path_str) {
 }
 
 // Parse a TensorSuite block-sparse text (.tns) file.
+// Metadata is required to determine sparsity_type and index_base (0 or 1).
 inline BlockSparseTensor parse_tensorsuite_block_tns(
     const std::string& tns_path,
     DataType dtype,
-    const std::vector<char>& labels = {},
-    const TensorSuiteMetadata* meta = nullptr,
+    const std::vector<char>& labels,
+    const TensorSuiteMetadata* meta,
     bool skip_values = false)
 {
+    if (!meta) {
+        throw std::runtime_error(
+            "TensorSuite .tns parsing requires metadata (*_metadata.json) to determine sparsity_type and index_base: " +
+            tns_path);
+    }
+
     std::ifstream file(tns_path);
     if (!file.is_open()) {
         throw std::runtime_error("Could not open TensorSuite .tns file: " + tns_path);
     }
 
     const auto hdr = detail::ts_parse_block_header_stream(file, "%%TensorSuite-TNS");
-    if (meta) {
-        detail::ts_cross_check_header_metadata(hdr, *meta);
-    }
+    detail::ts_cross_check_header_metadata(hdr, *meta);
 
-    const int index_base = meta ? meta->index_base : 0;
-    const bool disallow_dups = !meta || meta->duplicates != "allowed";
+    const int index_base = meta->index_base;
+    const bool disallow_dups = meta->duplicates != "allowed";
 
     std::set<std::vector<std::int64_t>> block_coords;
     std::int64_t seen = 0;
@@ -548,35 +558,38 @@ inline BlockSparseTensor parse_tensorsuite_block_tns(
 }
 
 // Parse a TensorSuite block-sparse binary (.tnsb) file.
+// Metadata is required to determine sparsity_type, index_base, index_type, and endianness.
 inline BlockSparseTensor parse_tensorsuite_block_tnsb(
     const std::string& tnsb_path,
     DataType dtype,
-    const std::vector<char>& labels = {},
-    const TensorSuiteMetadata* meta = nullptr,
+    const std::vector<char>& labels,
+    const TensorSuiteMetadata* meta,
     bool skip_values = false)
 {
+    if (!meta) {
+        throw std::runtime_error(
+            "TensorSuite .tnsb parsing requires metadata (*_metadata.json) to determine index_base, index_type, and endianness: " +
+            tnsb_path);
+    }
+
     std::ifstream file(tnsb_path, std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Could not open TensorSuite .tnsb file: " + tnsb_path);
     }
 
     const auto hdr = detail::ts_parse_block_header_stream(file, "%%TensorSuite-TNSB");
-    if (meta) {
-        detail::ts_cross_check_header_metadata(hdr, *meta);
-    }
+    detail::ts_cross_check_header_metadata(hdr, *meta);
 
-    const std::string index_type = meta ? meta->index_type : "uint64";
-    const std::string endianness = (meta && meta->endianness != "none" && !meta->endianness.empty())
-                                       ? meta->endianness
-                                       : "little";
-    const int index_base = meta ? meta->index_base : 0;
-    const bool disallow_dups = !meta || meta->duplicates != "allowed";
+    const std::string& index_type = meta->index_type;
+    const std::string& endianness = meta->endianness;
+    const int index_base = meta->index_base;
+    const bool disallow_dups = meta->duplicates != "allowed";
 
     if (index_type != "uint32" && index_type != "uint64") {
-        throw std::runtime_error("Unsupported TensorSuite .tnsb index_type: " + index_type);
+        throw std::runtime_error("Unsupported or missing TensorSuite .tnsb index_type: '" + index_type + "'");
     }
     if (endianness != "little" && endianness != "big") {
-        throw std::runtime_error("Unsupported TensorSuite .tnsb endianness: " + endianness);
+        throw std::runtime_error("Unsupported or missing TensorSuite .tnsb endianness: '" + endianness + "'");
     }
 
     const std::size_t elem_size = (index_type == "uint32") ? sizeof(std::uint32_t) : sizeof(std::uint64_t);
@@ -650,12 +663,13 @@ inline BlockSparseTensor parse_tensorsuite_tensor(
     }
 
     const std::string meta_path = find_tensorsuite_metadata_path(path_str);
-    TensorSuiteMetadata meta_storage;
-    const TensorSuiteMetadata* meta_ptr = nullptr;
-    if (!meta_path.empty()) {
-        meta_storage = parse_tensorsuite_metadata(meta_path);
-        meta_ptr = &meta_storage;
+    if (meta_path.empty()) {
+        throw std::runtime_error(
+            "Missing TensorSuite *_metadata.json for '" + path_str +
+            "'; metadata is required to determine sparsity_type, index_base, index_type, and endianness");
     }
+    const TensorSuiteMetadata meta_storage = parse_tensorsuite_metadata(meta_path);
+    const TensorSuiteMetadata* meta_ptr = &meta_storage;
 
     fs::path data_path;
     if (fs::is_directory(input_path) || input_path.extension() == ".json") {

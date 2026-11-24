@@ -351,9 +351,15 @@ static void test_validation_errors() {
         "0 1\n");
     CHECK_THROWS(parse_tensor_file(oor_dir.string(), DataType::FLOAT32, {'a', 'b'}));
 
-    // Wrong label count
-    const fs::path bad_lbl = tmp / "bad_lbl.tns";
-    write_text_file(bad_lbl,
+    // Wrong label count (with valid metadata)
+    const fs::path bad_lbl_dir = tmp / "bad_lbl";
+    write_text_file(bad_lbl_dir / "bad_lbl_metadata.json", R"({
+        "version": "0.1", "name": "bad_lbl", "sparsity_type": "block",
+        "index_base": 0, "order": 2, "dimensions": [4, 4], "nnz": 4,
+        "block_partitions": [2, 2], "nnz_block": 1,
+        "files": { "text": "bad_lbl.tns" }
+    })");
+    write_text_file(bad_lbl_dir / "bad_lbl.tns",
         "%%TensorSuite-TNS\n"
         "% version: 0.1\n"
         "% name: bad_lbl\n"
@@ -362,7 +368,88 @@ static void test_validation_errors() {
         "2 2\n"
         "2 2\n"
         "0 1\n");
-    CHECK_THROWS(parse_tensor_file(bad_lbl.string(), DataType::FLOAT32, {'a', 'b', 'c'}));
+    CHECK_THROWS(parse_tensor_file((bad_lbl_dir / "bad_lbl.tns").string(), DataType::FLOAT32, {'a', 'b', 'c'}));
+
+    // Missing metadata must fail fast rather than silently defaulting index_base=0
+    const fs::path no_meta = tmp / "no_meta.tns";
+    write_text_file(no_meta,
+        "%%TensorSuite-TNS\n"
+        "% version: 0.1\n"
+        "% name: no_meta\n"
+        "2 4 4 4\n"
+        "2 2 1\n"
+        "2 2\n"
+        "2 2\n"
+        "1 1\n");
+    CHECK_THROWS(parse_tensor_file(no_meta.string(), DataType::FLOAT32, {'a', 'b'}));
+
+    // Missing index_base in metadata JSON must throw
+    const fs::path no_ib_dir = tmp / "no_ib";
+    write_text_file(no_ib_dir / "no_ib_metadata.json", R"({
+        "version": "0.1", "name": "no_ib", "sparsity_type": "block",
+        "order": 2, "dimensions": [4, 4], "nnz": 4,
+        "block_partitions": [2, 2], "nnz_block": 1,
+        "files": { "text": "no_ib.tns" }
+    })");
+    write_text_file(no_ib_dir / "no_ib.tns",
+        "%%TensorSuite-TNS\n"
+        "% version: 0.1\n"
+        "% name: no_ib\n"
+        "2 4 4 4\n"
+        "2 2 1\n"
+        "2 2\n"
+        "2 2\n"
+        "0 0\n");
+    CHECK_THROWS(parse_tensor_file(no_ib_dir.string(), DataType::FLOAT32, {'a', 'b'}));
+
+    // Binary .tnsb with endianness="none" must throw
+    const fs::path bad_end_dir = tmp / "bad_end";
+    write_text_file(bad_end_dir / "bad_end_metadata.json", R"({
+        "version": "0.1", "name": "bad_end", "sparsity_type": "block",
+        "index_type": "uint64", "endianness": "none", "index_base": 0,
+        "order": 2, "dimensions": [4, 4], "nnz": 4,
+        "block_partitions": [2, 2], "nnz_block": 1,
+        "files": { "binary": "bad_end.tnsb" }
+    })");
+    write_tnsb_file<std::uint64_t>(
+        bad_end_dir / "bad_end.tnsb", "bad_end", {4, 4}, 4, {2, 2}, {{2, 2}, {2, 2}}, {{0, 0}}, false);
+    CHECK_THROWS(parse_tensor_file(bad_end_dir.string(), DataType::FLOAT32, {'a', 'b'}));
+
+    // FLOAT16 + binary value_domain must throw instead of overflowing host_data buffer
+    const fs::path bin_f16_dir = tmp / "bin_f16";
+    write_text_file(bin_f16_dir / "bin_f16_metadata.json", R"({
+        "version": "0.1", "name": "bin_f16", "sparsity_type": "block",
+        "value_domain": "binary", "index_base": 0,
+        "order": 2, "dimensions": [4, 4], "nnz": 4,
+        "block_partitions": [2, 2], "nnz_block": 1,
+        "files": { "text": "bin_f16.tns" }
+    })");
+    write_text_file(bin_f16_dir / "bin_f16.tns",
+        "%%TensorSuite-TNS\n"
+        "% version: 0.1\n"
+        "% name: bin_f16\n"
+        "2 4 4 4\n"
+        "2 2 1\n"
+        "2 2\n"
+        "2 2\n"
+        "0 0\n");
+    CHECK_THROWS(parse_tensor_file(bin_f16_dir.string(), DataType::FLOAT16, {'a', 'b'}));
+    // Metadata-only (skip_values=true) with FLOAT16 should still succeed
+    const auto f16_meta_only = parse_tensor_file(bin_f16_dir.string(), DataType::FLOAT16, {'a', 'b'}, true);
+    CHECK(f16_meta_only.block_coords.size() == 1);
+
+    // .bs files must keep their authoritative header labels even if different labels are passed
+    const fs::path bs_keep = tmp / "keep_labels.bs";
+    write_text_file(bs_keep,
+        "# Tensor A (ik)\n"
+        "{2, 3}\n"
+        "1\n"
+        "{4, 5, 6, 7, 8}\n"
+        "0, 1\n");
+    const auto t_keep = parse_tensor_file(bs_keep.string(), DataType::FLOAT32, {'k', 'i'});
+    CHECK(t_keep.meta.indices == (std::vector<char>{'i', 'k'}));
+    CHECK(t_keep.block_sizes.at('i') == (std::vector<std::int64_t>{4, 5}));
+    CHECK(t_keep.block_sizes.at('k') == (std::vector<std::int64_t>{6, 7, 8}));
 
     fs::remove_all(tmp);
 }
